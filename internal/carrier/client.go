@@ -8,11 +8,29 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
+	"net"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/houden/mirage/internal/auth"
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
+)
+
+const (
+	// DataBudget is the maximum bytes received on a single downstream
+	// connection before rotating it. Defeats TSPU freezing at ~15-20KB.
+	DataBudget = 12 * 1024
+
+	// UpstreamBudget is the maximum payload size for a single POST.
+	UpstreamBudget = 12 * 1024
+
+	// connLifetimeMin and connLifetimeMax define the random lifetime
+	// window for a downstream connection (seconds).
+	connLifetimeMin = 30
+	connLifetimeMax = 60
 )
 
 type ClientCarrier struct {
@@ -36,18 +54,39 @@ type ClientCarrierConfig struct {
 
 func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 	ctx, cancel := context.WithCancel(context.Background())
-	tr := &http.Transport{
-		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-		ForceAttemptHTTP2:   true,
-		MaxIdleConnsPerHost: 4,
-		DisableCompression:  true,
-		IdleConnTimeout:     90 * time.Second,
+
+	// Use http2.Transport directly with uTLS DialTLSContext.
+	// Go's http.Transport + DialTLSContext doesn't properly detect h2,
+	// causing "HTTP/1.x transport connection broken" errors.
+	h2tr := &http2.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			tlsConn := utls.UClient(conn, &utls.Config{
+				ServerName: host,
+				NextProtos: []string{"h2"},
+			}, utls.HelloChrome_Auto)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		},
+		DisableCompression: true,
 	}
+
 	return &ClientCarrier{
 		serverURL: "https://" + cfg.ServerAddr,
 		auth:      cfg.Auth,
 		sessionID: cfg.SessionID,
-		client:    &http.Client{Transport: tr},
+		client:    &http.Client{Transport: h2tr},
 		outbound:  cfg.Outbound,
 		deliver:   cfg.Deliver,
 		ctx:       ctx,
@@ -81,11 +120,23 @@ func (c *ClientCarrier) upstreamLoop() {
 			return
 		case pkt := <-c.outbound:
 			buf := encodePacket(pkt)
+			// Drain the channel, but respect the per-POST budget.
 		drain:
 			for {
 				select {
 				case extra := <-c.outbound:
-					buf = append(buf, encodePacket(extra)...)
+					encoded := encodePacket(extra)
+					if len(buf)+len(encoded) > UpstreamBudget {
+						// Current batch is full; send it, then
+						// start a new batch with this packet.
+						if err := c.sendUpstream(buf); err != nil {
+							log.Printf("carrier up: %v", err)
+							time.Sleep(200 * time.Millisecond)
+						}
+						buf = encoded
+					} else {
+						buf = append(buf, encoded...)
+					}
 				default:
 					break drain
 				}
@@ -132,7 +183,14 @@ func (c *ClientCarrier) sendUpstream(data []byte) error {
 }
 
 func (c *ClientCarrier) openDownstream() error {
-	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet,
+	// Pick a random lifetime for this connection (30-60s).
+	lifetime := time.Duration(connLifetimeMin+rand.Intn(connLifetimeMax-connLifetimeMin+1)) * time.Second
+	deadline := time.Now().Add(lifetime)
+
+	connCtx, connCancel := context.WithDeadline(c.ctx, deadline)
+	defer connCancel()
+
+	req, err := http.NewRequestWithContext(connCtx, http.MethodGet,
 		c.serverURL+"/api/v2/stream", nil)
 	if err != nil {
 		return err
@@ -141,6 +199,12 @@ func (c *ClientCarrier) openDownstream() error {
 
 	resp, err := c.client.Do(req)
 	if err != nil {
+		// If the parent context is fine but our deadline fired, this is
+		// a normal rotation -- not an error worth propagating.
+		if c.ctx.Err() == nil && connCtx.Err() != nil {
+			log.Printf("carrier: rotating downstream (bytes=0, age=%s)", lifetime)
+			return nil
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -149,16 +213,35 @@ func (c *ClientCarrier) openDownstream() error {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 
+	start := time.Now()
+	var totalBytes int64
+
 	for {
 		var pktLen uint16
 		if err := binary.Read(resp.Body, binary.BigEndian, &pktLen); err != nil {
+			// Context deadline means we hit the lifetime cap.
+			if connCtx.Err() != nil && c.ctx.Err() == nil {
+				log.Printf("carrier: rotating downstream (bytes=%d, age=%s)", totalBytes, time.Since(start).Round(time.Millisecond))
+				return nil
+			}
 			return err
 		}
 		pkt := make([]byte, pktLen)
 		if _, err := io.ReadFull(resp.Body, pkt); err != nil {
+			if connCtx.Err() != nil && c.ctx.Err() == nil {
+				log.Printf("carrier: rotating downstream (bytes=%d, age=%s)", totalBytes, time.Since(start).Round(time.Millisecond))
+				return nil
+			}
 			return err
 		}
+		totalBytes += int64(pktLen) + 2 // include the 2-byte length header
 		c.deliver(pkt)
+
+		// Data budget exceeded -- rotate.
+		if totalBytes >= DataBudget {
+			log.Printf("carrier: rotating downstream (bytes=%d, age=%s)", totalBytes, time.Since(start).Round(time.Millisecond))
+			return nil
+		}
 	}
 }
 
