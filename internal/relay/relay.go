@@ -11,12 +11,14 @@ func Bidirectional(a, b io.ReadWriteCloser) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(b, a)
+		buf := make([]byte, 256*1024) // 256KB buffer for throughput
+		io.CopyBuffer(b, a, buf)
 		closeWrite(b)
 	}()
 	go func() {
 		defer wg.Done()
-		io.Copy(a, b)
+		buf := make([]byte, 256*1024)
+		io.CopyBuffer(a, b, buf)
 		closeWrite(a)
 	}()
 	wg.Wait()

@@ -147,12 +147,13 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	// Read from downstream BufPipe, write to response
-	buf := make([]byte, 64*1024)
+	// Read from downstream BufPipe, write to response.
+	// Use WaitAndDrain to batch: sends all buffered data at once,
+	// reducing flush() syscall overhead for high throughput.
 	for {
-		n, err := ss.downstream.Read(buf)
-		if n > 0 {
-			w.Write(buf[:n])
+		data, err := ss.downstream.WaitAndDrain()
+		if len(data) > 0 {
+			w.Write(data)
 			flusher.Flush()
 		}
 		if err != nil {
