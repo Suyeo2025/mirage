@@ -38,9 +38,13 @@ func NewServerSession() (*ServerSession, error) {
 
 	tr := &quic.Transport{Conn: conn}
 	ln, err := tr.Listen(tlsConf, &quic.Config{
-		MaxIdleTimeout:  60 * time.Second,
-		KeepAlivePeriod: 15 * time.Second,
-		Allow0RTT:       true,
+		MaxIdleTimeout:                 60 * time.Second,
+		KeepAlivePeriod:                15 * time.Second,
+		Allow0RTT:                      true,
+		InitialStreamReceiveWindow:     10 * 1024 * 1024,
+		MaxStreamReceiveWindow:         20 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 15 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     30 * 1024 * 1024,
 	})
 	if err != nil {
 		return nil, err

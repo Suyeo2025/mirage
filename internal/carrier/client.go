@@ -3,7 +3,6 @@ package carrier
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -16,17 +15,17 @@ import (
 	"time"
 
 	"github.com/houden/mirage/internal/auth"
-	"github.com/houden/mirage/internal/morph"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
 
 const (
-	DataBudget     = 2 * 1024 * 1024 // 2MB per downstream connection
-	UpstreamBudget = 256 * 1024      // 256KB per POST
-
+	DataBudget      = 2 * 1024 * 1024
 	connLifetimeMin = 60
 	connLifetimeMax = 180
+	// Batch multiple QUIC packets per POST for efficiency.
+	// Wait up to this long to collect more packets before sending.
+	batchWait = 2 * time.Millisecond
 )
 
 type ClientCarrier struct {
@@ -38,8 +37,6 @@ type ClientCarrier struct {
 	deliver   func(data []byte)
 	ctx       context.Context
 	cancel    context.CancelFunc
-	morpher   *morph.Morpher
-	startTime time.Time
 }
 
 type ClientCarrierConfig struct {
@@ -86,8 +83,6 @@ func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 		deliver:   cfg.Deliver,
 		ctx:       ctx,
 		cancel:    cancel,
-		morpher:   morph.New(10.0), // tau=10s exponential decay
-		startTime: time.Now(),
 	}
 }
 
@@ -110,27 +105,9 @@ func (c *ClientCarrier) freshToken() string {
 	return token
 }
 
-func (c *ClientCarrier) streamAge() time.Duration {
-	return time.Since(c.startTime)
-}
-
-// maybePad appends random padding bytes to data based on morphing probability.
-// Early in session: high probability, large padding. Later: decays to zero.
-func (c *ClientCarrier) maybePad(data []byte) []byte {
-	if !c.morpher.ShouldPad(c.streamAge()) {
-		return data
-	}
-	padSize := c.morpher.PadSize()
-	if padSize > 4096 {
-		padSize = 4096 // cap padding to avoid excessive overhead
-	}
-	padding := make([]byte, padSize)
-	rand.Read(padding)
-	// Append as a "padding packet" with length prefix (server ignores unknown data after valid packets)
-	padPkt := encodePacket(padding)
-	return append(data, padPkt...)
-}
-
+// upstreamLoop sends QUIC packets via HTTP POST.
+// Uses batching with a short delay to collect multiple packets per POST,
+// dramatically reducing HTTP round-trip overhead while keeping latency low.
 func (c *ClientCarrier) upstreamLoop() {
 	for {
 		select {
@@ -138,48 +115,29 @@ func (c *ClientCarrier) upstreamLoop() {
 			return
 		case pkt := <-c.outbound:
 			buf := encodePacket(pkt)
+			// Short wait to batch more packets
+			timer := time.NewTimer(batchWait)
 		drain:
 			for {
 				select {
 				case extra := <-c.outbound:
-					encoded := encodePacket(extra)
-					if len(buf)+len(encoded) > UpstreamBudget {
-						payload := c.maybePad(buf)
-						if err := c.sendUpstream(payload); err != nil {
-							log.Printf("carrier up: %v", err)
-							time.Sleep(200 * time.Millisecond)
-						}
-						buf = encoded
-					} else {
-						buf = append(buf, encoded...)
+					buf = append(buf, encodePacket(extra)...)
+					if len(buf) > 32*1024 { // flush at 32KB
+						break drain
 					}
-				default:
+				case <-timer.C:
 					break drain
+				case <-c.ctx.Done():
+					timer.Stop()
+					return
 				}
 			}
+			timer.Stop()
 
-			// Apply morphing: maybe add padding + inter-packet delay
-			payload := c.maybePad(buf)
-			if delay := c.morpher.InterPacketDelay(c.streamAge()); delay > 0 {
-				time.Sleep(delay)
-			}
-
-			if err := c.sendUpstream(payload); err != nil {
+			if err := c.sendUpstream(buf); err != nil {
 				log.Printf("carrier up: %v", err)
 				time.Sleep(200 * time.Millisecond)
 			}
-		}
-	}
-}
-
-func (c *ClientCarrier) downstreamLoop() {
-	for {
-		if c.ctx.Err() != nil {
-			return
-		}
-		if err := c.openDownstream(); err != nil {
-			log.Printf("carrier down: %v", err)
-			time.Sleep(500 * time.Millisecond)
 		}
 	}
 }
@@ -205,11 +163,21 @@ func (c *ClientCarrier) sendUpstream(data []byte) error {
 	return nil
 }
 
+func (c *ClientCarrier) downstreamLoop() {
+	for {
+		if c.ctx.Err() != nil {
+			return
+		}
+		if err := c.openDownstream(); err != nil {
+			log.Printf("carrier down: %v", err)
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+}
+
 func (c *ClientCarrier) openDownstream() error {
 	lifetime := time.Duration(connLifetimeMin+mrand.Intn(connLifetimeMax-connLifetimeMin+1)) * time.Second
-	deadline := time.Now().Add(lifetime)
-
-	connCtx, connCancel := context.WithDeadline(c.ctx, deadline)
+	connCtx, connCancel := context.WithTimeout(c.ctx, lifetime)
 	defer connCancel()
 
 	req, err := http.NewRequestWithContext(connCtx, http.MethodGet,
@@ -222,7 +190,6 @@ func (c *ClientCarrier) openDownstream() error {
 	resp, err := c.client.Do(req)
 	if err != nil {
 		if c.ctx.Err() == nil && connCtx.Err() != nil {
-			log.Printf("carrier: rotating downstream (bytes=0, age=%s)", lifetime)
 			return nil
 		}
 		return err
@@ -240,7 +207,8 @@ func (c *ClientCarrier) openDownstream() error {
 		var pktLen uint16
 		if err := binary.Read(resp.Body, binary.BigEndian, &pktLen); err != nil {
 			if connCtx.Err() != nil && c.ctx.Err() == nil {
-				log.Printf("carrier: rotating downstream (bytes=%d, age=%s)", totalBytes, time.Since(start).Round(time.Millisecond))
+				log.Printf("carrier: rotating downstream (bytes=%d, age=%s)",
+					totalBytes, time.Since(start).Round(time.Millisecond))
 				return nil
 			}
 			return err
@@ -248,7 +216,8 @@ func (c *ClientCarrier) openDownstream() error {
 		pkt := make([]byte, pktLen)
 		if _, err := io.ReadFull(resp.Body, pkt); err != nil {
 			if connCtx.Err() != nil && c.ctx.Err() == nil {
-				log.Printf("carrier: rotating downstream (bytes=%d, age=%s)", totalBytes, time.Since(start).Round(time.Millisecond))
+				log.Printf("carrier: rotating downstream (bytes=%d, age=%s)",
+					totalBytes, time.Since(start).Round(time.Millisecond))
 				return nil
 			}
 			return err
@@ -257,7 +226,8 @@ func (c *ClientCarrier) openDownstream() error {
 		c.deliver(pkt)
 
 		if totalBytes >= DataBudget {
-			log.Printf("carrier: rotating downstream (bytes=%d, age=%s)", totalBytes, time.Since(start).Round(time.Millisecond))
+			log.Printf("carrier: rotating downstream (bytes=%d, age=%s)",
+				totalBytes, time.Since(start).Round(time.Millisecond))
 			return nil
 		}
 	}

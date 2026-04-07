@@ -90,7 +90,8 @@ func (sc *ServerCarrier) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// A chunked video/mp4 response at 40 Mbps is perfectly normal CDN behavior
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering (nginx/CDN)
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 

@@ -26,8 +26,12 @@ func DialClientSession(ctx context.Context, memConn *MemPacketConn) (*ClientSess
 	tr := &quic.Transport{Conn: memConn}
 
 	qConn, err := tr.Dial(ctx, &memAddr{}, tlsConf, &quic.Config{
-		MaxIdleTimeout:  60 * time.Second,
-		KeepAlivePeriod: 15 * time.Second,
+		MaxIdleTimeout:                 60 * time.Second,
+		KeepAlivePeriod:                15 * time.Second,
+		InitialStreamReceiveWindow:     10 * 1024 * 1024, // 10MB — allow large bursts without ACK
+		MaxStreamReceiveWindow:         20 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 15 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     30 * 1024 * 1024,
 	})
 	if err != nil {
 		return nil, err
