@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -15,36 +14,34 @@ import (
 	"time"
 
 	"github.com/houden/mirage/internal/auth"
+	"github.com/houden/mirage/internal/mux"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
 
 const (
-	DataBudget      = 2 * 1024 * 1024
-	connLifetimeMin = 60
-	connLifetimeMax = 180
-	// Batch multiple QUIC packets per POST for efficiency.
-	// Wait up to this long to collect more packets before sending.
-	batchWait = 2 * time.Millisecond
+	connLifetimeMin = 120
+	connLifetimeMax = 300
+	batchWait       = 3 * time.Millisecond // short wait to batch upstream frames
 )
 
 type ClientCarrier struct {
-	serverURL string
-	auth      *auth.Auth
-	sessionID []byte
-	client    *http.Client
-	outbound  <-chan []byte
-	deliver   func(data []byte)
-	ctx       context.Context
-	cancel    context.CancelFunc
+	serverURL   string
+	auth        *auth.Auth
+	sessionID   []byte
+	client      *http.Client
+	upstream    *mux.BufPipe   // mux writes here → carrier reads → POST
+	downstreamW *io.PipeWriter // carrier writes here ← GET response → mux reads
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 type ClientCarrierConfig struct {
-	ServerAddr string
-	Auth       *auth.Auth
-	SessionID  []byte
-	Outbound   <-chan []byte
-	Deliver    func(data []byte)
+	ServerAddr  string
+	Auth        *auth.Auth
+	SessionID   []byte
+	Upstream    *mux.BufPipe   // mux session writes frames here
+	DownstreamW *io.PipeWriter // carrier writes received frames here
 }
 
 func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
@@ -75,14 +72,14 @@ func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 	}
 
 	return &ClientCarrier{
-		serverURL: "https://" + cfg.ServerAddr,
-		auth:      cfg.Auth,
-		sessionID: cfg.SessionID,
-		client:    &http.Client{Transport: h2tr},
-		outbound:  cfg.Outbound,
-		deliver:   cfg.Deliver,
-		ctx:       ctx,
-		cancel:    cancel,
+		serverURL:   "https://" + cfg.ServerAddr,
+		auth:        cfg.Auth,
+		sessionID:   cfg.SessionID,
+		client:      &http.Client{Transport: h2tr},
+		upstream:    cfg.Upstream,
+		downstreamW: cfg.DownstreamW,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -97,54 +94,38 @@ func (c *ClientCarrier) Run() {
 func (c *ClientCarrier) Stop() { c.cancel() }
 
 func (c *ClientCarrier) freshToken() string {
-	token, err := c.auth.Generate(1, c.sessionID)
-	if err != nil {
-		log.Printf("carrier: generate token: %v", err)
-		return ""
-	}
-	return token
+	t, _ := c.auth.Generate(1, c.sessionID)
+	return t
 }
 
-// upstreamLoop sends QUIC packets via HTTP POST.
-// Uses batching with a short delay to collect multiple packets per POST,
-// dramatically reducing HTTP round-trip overhead while keeping latency low.
+// upstreamLoop: drain buffered mux frames from BufPipe, send as POST batches.
+// BufPipe never blocks on write, so mux is never stalled.
 func (c *ClientCarrier) upstreamLoop() {
 	for {
-		select {
-		case <-c.ctx.Done():
+		if c.ctx.Err() != nil {
 			return
-		case pkt := <-c.outbound:
-			buf := encodePacket(pkt)
-			// Short wait to batch more packets
-			timer := time.NewTimer(batchWait)
-		drain:
-			for {
-				select {
-				case extra := <-c.outbound:
-					buf = append(buf, encodePacket(extra)...)
-					if len(buf) > 32*1024 { // flush at 32KB
-						break drain
-					}
-				case <-timer.C:
-					break drain
-				case <-c.ctx.Done():
-					timer.Stop()
-					return
-				}
-			}
-			timer.Stop()
+		}
+		// Block until data is available
+		data, err := c.upstream.WaitAndDrain()
+		if err != nil {
+			return
+		}
+		// Short wait to batch more
+		time.Sleep(batchWait)
+		if extra := c.upstream.Drain(); len(extra) > 0 {
+			data = append(data, extra...)
+		}
 
-			if err := c.sendUpstream(buf); err != nil {
-				log.Printf("carrier up: %v", err)
-				time.Sleep(200 * time.Millisecond)
-			}
+		if err := c.sendPost(data); err != nil {
+			log.Printf("carrier up: %v", err)
+			time.Sleep(200 * time.Millisecond)
 		}
 	}
 }
 
-func (c *ClientCarrier) sendUpstream(data []byte) error {
+func (c *ClientCarrier) sendPost(data []byte) error {
 	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost,
-		c.serverURL+"/api/v2/upload", bytes.NewReader(data))
+		c.serverURL+"/api/v2/tunnel", bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -163,25 +144,26 @@ func (c *ClientCarrier) sendUpstream(data []byte) error {
 	return nil
 }
 
+// downstreamLoop: persistent GET, streams response to downstreamW.
 func (c *ClientCarrier) downstreamLoop() {
 	for {
 		if c.ctx.Err() != nil {
 			return
 		}
-		if err := c.openDownstream(); err != nil {
+		if err := c.openGet(); err != nil {
 			log.Printf("carrier down: %v", err)
 			time.Sleep(300 * time.Millisecond)
 		}
 	}
 }
 
-func (c *ClientCarrier) openDownstream() error {
+func (c *ClientCarrier) openGet() error {
 	lifetime := time.Duration(connLifetimeMin+mrand.Intn(connLifetimeMax-connLifetimeMin+1)) * time.Second
 	connCtx, connCancel := context.WithTimeout(c.ctx, lifetime)
 	defer connCancel()
 
 	req, err := http.NewRequestWithContext(connCtx, http.MethodGet,
-		c.serverURL+"/api/v2/stream", nil)
+		c.serverURL+"/api/v2/tunnel", nil)
 	if err != nil {
 		return err
 	}
@@ -200,42 +182,12 @@ func (c *ClientCarrier) openDownstream() error {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 
+	// Stream response body directly to mux downstream
 	start := time.Now()
-	var totalBytes int64
-
-	for {
-		var pktLen uint16
-		if err := binary.Read(resp.Body, binary.BigEndian, &pktLen); err != nil {
-			if connCtx.Err() != nil && c.ctx.Err() == nil {
-				log.Printf("carrier: rotating downstream (bytes=%d, age=%s)",
-					totalBytes, time.Since(start).Round(time.Millisecond))
-				return nil
-			}
-			return err
-		}
-		pkt := make([]byte, pktLen)
-		if _, err := io.ReadFull(resp.Body, pkt); err != nil {
-			if connCtx.Err() != nil && c.ctx.Err() == nil {
-				log.Printf("carrier: rotating downstream (bytes=%d, age=%s)",
-					totalBytes, time.Since(start).Round(time.Millisecond))
-				return nil
-			}
-			return err
-		}
-		totalBytes += int64(pktLen) + 2
-		c.deliver(pkt)
-
-		if totalBytes >= DataBudget {
-			log.Printf("carrier: rotating downstream (bytes=%d, age=%s)",
-				totalBytes, time.Since(start).Round(time.Millisecond))
-			return nil
-		}
+	n, _ := io.Copy(c.downstreamW, resp.Body)
+	if connCtx.Err() != nil && c.ctx.Err() == nil {
+		log.Printf("carrier: rotating downstream (bytes=%d, age=%s)",
+			n, time.Since(start).Round(time.Millisecond))
 	}
-}
-
-func encodePacket(pkt []byte) []byte {
-	buf := make([]byte, 2+len(pkt))
-	binary.BigEndian.PutUint16(buf[0:2], uint16(len(pkt)))
-	copy(buf[2:], pkt)
-	return buf
+	return nil
 }

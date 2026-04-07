@@ -1,17 +1,17 @@
 package client
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 
 	"github.com/houden/mirage/internal/auth"
 	"github.com/houden/mirage/internal/carrier"
+	"github.com/houden/mirage/internal/mux"
 	"github.com/houden/mirage/internal/relay"
-	"github.com/houden/mirage/internal/session"
 )
 
 type Config struct {
@@ -29,57 +29,53 @@ type Client struct {
 func New(cfg Config) *Client {
 	sid := make([]byte, 16)
 	rand.Read(sid)
-	return &Client{
-		config:    cfg,
-		auth:      auth.New(cfg.PSK),
-		sessionID: sid,
-	}
+	return &Client{config: cfg, auth: auth.New(cfg.PSK), sessionID: sid}
 }
 
 func (c *Client) Run() error {
-	ctx := context.Background()
+	// upstream: mux writes frames → BufPipe (never blocks) → carrier reads → POST
+	upstream := mux.NewBufPipe()
 
-	// Create the in-memory QUIC transport (not connected yet)
-	memConn := session.NewMemPacketConn(512)
+	// downstream: carrier writes from GET response → io.Pipe → mux reads frames
+	downR, downW := io.Pipe()
 
-	// Start carrier FIRST — so it can deliver QUIC handshake packets
+	// mux session writes upstream frames to BufPipe
+	sess := mux.NewSession(upstream)
+
+	// carrier bridges mux ↔ HTTPS
 	car := carrier.NewClientCarrier(carrier.ClientCarrierConfig{
-		ServerAddr: c.config.ServerAddr,
-		Auth:       c.auth,
-		SessionID:  c.sessionID,
-		Outbound:   memConn.Outbound(),
-		Deliver:    memConn.Deliver,
+		ServerAddr:  c.config.ServerAddr,
+		Auth:        c.auth,
+		SessionID:   c.sessionID,
+		Upstream:    upstream,
+		DownstreamW: downW,
 	})
 	go car.Run()
-	defer car.Stop()
 
-	// NOW create the QUIC session — handshake packets flow through carrier
-	sess, err := session.DialClientSession(ctx, memConn)
-	if err != nil {
-		return fmt.Errorf("dial session: %w", err)
-	}
-	defer sess.Close()
+	// mux reads downstream frames from pipe
+	go func() {
+		if err := sess.RecvLoop(downR); err != nil {
+			log.Printf("mux recv: %v", err)
+		}
+	}()
 
-	log.Printf("inner QUIC session established")
+	log.Printf("SOCKS5 on %s → %s", c.config.Listen, c.config.ServerAddr)
 
-	// Start SOCKS5 listener
 	ln, err := net.Listen("tcp", c.config.Listen)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	log.Printf("SOCKS5 on %s → %s (Turbo Tunnel)", c.config.Listen, c.config.ServerAddr)
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go c.handleConn(ctx, sess, conn)
+		go c.handleConn(sess, conn)
 	}
 }
 
-func (c *Client) handleConn(ctx context.Context, sess *session.ClientSession, conn net.Conn) {
+func (c *Client) handleConn(sess *mux.Session, conn net.Conn) {
 	defer conn.Close()
 
 	target, err := handleSocks5(conn)
@@ -88,23 +84,20 @@ func (c *Client) handleConn(ctx context.Context, sess *session.ClientSession, co
 		return
 	}
 
-	stream, err := sess.OpenStream(ctx)
+	stream, err := sess.OpenStream()
 	if err != nil {
 		log.Printf("open stream: %v", err)
 		return
 	}
+	defer stream.Close()
 
-	sc := session.NewStreamConn(stream)
-	defer sc.Close()
-
-	// Send target address (length-prefixed)
 	targetBytes := []byte(target)
 	var lenBuf [2]byte
 	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(targetBytes)))
-	sc.Write(lenBuf[:])
-	sc.Write(targetBytes)
+	stream.Write(lenBuf[:])
+	stream.Write(targetBytes)
 
-	relay.Bidirectional(conn, sc)
+	relay.Bidirectional(conn, stream)
 }
 
 func handleSocks5(conn net.Conn) (string, error) {
@@ -114,12 +107,10 @@ func handleSocks5(conn net.Conn) (string, error) {
 		return "", fmt.Errorf("bad greeting")
 	}
 	conn.Write([]byte{0x05, 0x00})
-
 	n, err = conn.Read(buf)
 	if err != nil || n < 7 || buf[1] != 0x01 {
 		return "", fmt.Errorf("bad request")
 	}
-
 	var target string
 	switch buf[3] {
 	case 0x01:
@@ -132,7 +123,6 @@ func handleSocks5(conn net.Conn) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported atyp %d", buf[3])
 	}
-
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	return target, nil
 }
