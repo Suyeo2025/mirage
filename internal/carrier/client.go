@@ -20,17 +20,19 @@ import (
 )
 
 const (
-	// DataBudget is the maximum bytes received on a single downstream
-	// connection before rotating it. Defeats TSPU freezing at ~15-20KB.
-	DataBudget = 12 * 1024
+	// CDN mode uses a much larger budget since CDN IPs are not subject to
+	// Russia's TSPU 15-20KB freezing. Only Direct mode needs 12KB.
+	// 2MB budget = ~10-60 seconds of streaming, matching real video behavior.
+	DataBudget = 2 * 1024 * 1024 // 2MB per downstream connection
 
 	// UpstreamBudget is the maximum payload size for a single POST.
-	UpstreamBudget = 12 * 1024
+	UpstreamBudget = 256 * 1024 // 256KB — large enough for efficiency
 
 	// connLifetimeMin and connLifetimeMax define the random lifetime
-	// window for a downstream connection (seconds).
-	connLifetimeMin = 30
-	connLifetimeMax = 60
+	// window for a downstream connection (seconds). Matches typical
+	// video segment duration in adaptive bitrate streaming.
+	connLifetimeMin = 60
+	connLifetimeMax = 180
 )
 
 type ClientCarrier struct {

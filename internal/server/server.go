@@ -83,22 +83,36 @@ func (s *Server) Run() error {
 	return srv.ListenAndServeTLS("", "")
 }
 
-// authGate wraps a handler: if auth fails, serve website instead.
+// authGate wraps a handler: if auth fails, return realistic API error.
 func (s *Server) authGate(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			s.serveWebsite(w, r)
+			// No auth → return JSON API error (looks like a real API)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"authentication required","code":401}`))
 			return
 		}
-		// Let the carrier handler do its own auth validation
-		// If the carrier returns false (auth failed), we fall through here
 		next(w, r)
 	}
 }
 
 func (s *Server) serveWebsite(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, fmt.Sprintf("%s/index.html", s.config.WebRoot))
+	// Serve real website for root path, 404 for unknown paths
+	if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+		http.ServeFile(w, r, fmt.Sprintf("%s/index.html", s.config.WebRoot))
+		return
+	}
+	// Static assets
+	if r.URL.Path == "/favicon.ico" || r.URL.Path == "/robots.txt" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	// Unknown path → 404 like a real web server
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	w.Write([]byte("<!DOCTYPE html><html><head><title>404</title></head><body><h1>Not Found</h1></body></html>"))
 }
 
 // handleNewSession is called when a new inner session is established.
