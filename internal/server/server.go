@@ -49,6 +49,10 @@ func New(cfg Config) *Server {
 
 func (s *Server) Run() error {
 	mux := http.NewServeMux()
+	// Specter-inspired: use realistic API paths that match a media/education platform
+	mux.HandleFunc("/api/v1/sync", s.authGate(s.carrier.HandleUpload))         // upstream: "sync notes"
+	mux.HandleFunc("/api/v1/courses/stream", s.authGate(s.carrier.HandleStream)) // downstream: "watch video"
+	// Keep original paths as aliases for backward compat
 	mux.HandleFunc("/api/v2/upload", s.authGate(s.carrier.HandleUpload))
 	mux.HandleFunc("/api/v2/stream", s.authGate(s.carrier.HandleStream))
 	mux.HandleFunc("/", s.serveWebsite)

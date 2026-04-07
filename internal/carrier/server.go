@@ -84,7 +84,11 @@ func (sc *ServerCarrier) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
+	// Disguise as video streaming — the most common CDN traffic type
+	// A chunked video/mp4 response at 40 Mbps is perfectly normal CDN behavior
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
