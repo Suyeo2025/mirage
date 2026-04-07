@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 	"io"
 	"log"
+	mrand "math/rand"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/houden/mirage/internal/auth"
 )
@@ -93,6 +95,14 @@ func (sc *ServerCarrier) HandleStream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	ctx := r.Context()
+
+	// Keepalive timer: send small padding during idle periods
+	// to simulate video buffering / heartbeat. Prevents the connection
+	// from looking "dead" during proxy idle, which would be unusual
+	// for a video stream.
+	keepalive := time.NewTicker(5 * time.Second)
+	defer keepalive.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -102,6 +112,16 @@ func (sc *ServerCarrier) HandleStream(w http.ResponseWriter, r *http.Request) {
 			binary.BigEndian.PutUint16(lenBuf[:], uint16(len(pkt)))
 			w.Write(lenBuf[:])
 			w.Write(pkt)
+			flusher.Flush()
+		case <-keepalive.C:
+			// Inject small keepalive padding (looks like video buffer probe)
+			// QUIC will silently ignore these non-QUIC bytes
+			padSize := 64 + mrand.Intn(128) // 64-192 bytes
+			pad := make([]byte, padSize)
+			var lenBuf [2]byte
+			binary.BigEndian.PutUint16(lenBuf[:], uint16(padSize))
+			w.Write(lenBuf[:])
+			w.Write(pad)
 			flusher.Flush()
 		}
 	}

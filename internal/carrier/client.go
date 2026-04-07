@@ -3,34 +3,28 @@ package carrier
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/houden/mirage/internal/auth"
+	"github.com/houden/mirage/internal/morph"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
 
 const (
-	// CDN mode uses a much larger budget since CDN IPs are not subject to
-	// Russia's TSPU 15-20KB freezing. Only Direct mode needs 12KB.
-	// 2MB budget = ~10-60 seconds of streaming, matching real video behavior.
-	DataBudget = 2 * 1024 * 1024 // 2MB per downstream connection
+	DataBudget     = 2 * 1024 * 1024 // 2MB per downstream connection
+	UpstreamBudget = 256 * 1024      // 256KB per POST
 
-	// UpstreamBudget is the maximum payload size for a single POST.
-	UpstreamBudget = 256 * 1024 // 256KB — large enough for efficiency
-
-	// connLifetimeMin and connLifetimeMax define the random lifetime
-	// window for a downstream connection (seconds). Matches typical
-	// video segment duration in adaptive bitrate streaming.
 	connLifetimeMin = 60
 	connLifetimeMax = 180
 )
@@ -44,6 +38,8 @@ type ClientCarrier struct {
 	deliver   func(data []byte)
 	ctx       context.Context
 	cancel    context.CancelFunc
+	morpher   *morph.Morpher
+	startTime time.Time
 }
 
 type ClientCarrierConfig struct {
@@ -57,9 +53,6 @@ type ClientCarrierConfig struct {
 func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Use http2.Transport directly with uTLS DialTLSContext.
-	// Go's http.Transport + DialTLSContext doesn't properly detect h2,
-	// causing "HTTP/1.x transport connection broken" errors.
 	h2tr := &http2.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
@@ -93,6 +86,8 @@ func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 		deliver:   cfg.Deliver,
 		ctx:       ctx,
 		cancel:    cancel,
+		morpher:   morph.New(10.0), // tau=10s exponential decay
+		startTime: time.Now(),
 	}
 }
 
@@ -115,6 +110,27 @@ func (c *ClientCarrier) freshToken() string {
 	return token
 }
 
+func (c *ClientCarrier) streamAge() time.Duration {
+	return time.Since(c.startTime)
+}
+
+// maybePad appends random padding bytes to data based on morphing probability.
+// Early in session: high probability, large padding. Later: decays to zero.
+func (c *ClientCarrier) maybePad(data []byte) []byte {
+	if !c.morpher.ShouldPad(c.streamAge()) {
+		return data
+	}
+	padSize := c.morpher.PadSize()
+	if padSize > 4096 {
+		padSize = 4096 // cap padding to avoid excessive overhead
+	}
+	padding := make([]byte, padSize)
+	rand.Read(padding)
+	// Append as a "padding packet" with length prefix (server ignores unknown data after valid packets)
+	padPkt := encodePacket(padding)
+	return append(data, padPkt...)
+}
+
 func (c *ClientCarrier) upstreamLoop() {
 	for {
 		select {
@@ -122,16 +138,14 @@ func (c *ClientCarrier) upstreamLoop() {
 			return
 		case pkt := <-c.outbound:
 			buf := encodePacket(pkt)
-			// Drain the channel, but respect the per-POST budget.
 		drain:
 			for {
 				select {
 				case extra := <-c.outbound:
 					encoded := encodePacket(extra)
 					if len(buf)+len(encoded) > UpstreamBudget {
-						// Current batch is full; send it, then
-						// start a new batch with this packet.
-						if err := c.sendUpstream(buf); err != nil {
+						payload := c.maybePad(buf)
+						if err := c.sendUpstream(payload); err != nil {
 							log.Printf("carrier up: %v", err)
 							time.Sleep(200 * time.Millisecond)
 						}
@@ -143,7 +157,14 @@ func (c *ClientCarrier) upstreamLoop() {
 					break drain
 				}
 			}
-			if err := c.sendUpstream(buf); err != nil {
+
+			// Apply morphing: maybe add padding + inter-packet delay
+			payload := c.maybePad(buf)
+			if delay := c.morpher.InterPacketDelay(c.streamAge()); delay > 0 {
+				time.Sleep(delay)
+			}
+
+			if err := c.sendUpstream(payload); err != nil {
 				log.Printf("carrier up: %v", err)
 				time.Sleep(200 * time.Millisecond)
 			}
@@ -185,8 +206,7 @@ func (c *ClientCarrier) sendUpstream(data []byte) error {
 }
 
 func (c *ClientCarrier) openDownstream() error {
-	// Pick a random lifetime for this connection (30-60s).
-	lifetime := time.Duration(connLifetimeMin+rand.Intn(connLifetimeMax-connLifetimeMin+1)) * time.Second
+	lifetime := time.Duration(connLifetimeMin+mrand.Intn(connLifetimeMax-connLifetimeMin+1)) * time.Second
 	deadline := time.Now().Add(lifetime)
 
 	connCtx, connCancel := context.WithDeadline(c.ctx, deadline)
@@ -201,8 +221,6 @@ func (c *ClientCarrier) openDownstream() error {
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		// If the parent context is fine but our deadline fired, this is
-		// a normal rotation -- not an error worth propagating.
 		if c.ctx.Err() == nil && connCtx.Err() != nil {
 			log.Printf("carrier: rotating downstream (bytes=0, age=%s)", lifetime)
 			return nil
@@ -221,7 +239,6 @@ func (c *ClientCarrier) openDownstream() error {
 	for {
 		var pktLen uint16
 		if err := binary.Read(resp.Body, binary.BigEndian, &pktLen); err != nil {
-			// Context deadline means we hit the lifetime cap.
 			if connCtx.Err() != nil && c.ctx.Err() == nil {
 				log.Printf("carrier: rotating downstream (bytes=%d, age=%s)", totalBytes, time.Since(start).Round(time.Millisecond))
 				return nil
@@ -236,10 +253,9 @@ func (c *ClientCarrier) openDownstream() error {
 			}
 			return err
 		}
-		totalBytes += int64(pktLen) + 2 // include the 2-byte length header
+		totalBytes += int64(pktLen) + 2
 		c.deliver(pkt)
 
-		// Data budget exceeded -- rotate.
 		if totalBytes >= DataBudget {
 			log.Printf("carrier: rotating downstream (bytes=%d, age=%s)", totalBytes, time.Since(start).Round(time.Millisecond))
 			return nil
