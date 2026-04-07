@@ -10,6 +10,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/argon2"
 )
 
 type Auth struct {
@@ -19,8 +21,14 @@ type Auth struct {
 	seen   map[[12]byte]time.Time
 }
 
+const maxSeenNonces = 100_000
+
 func New(psk string) *Auth {
-	key := sha256.Sum256([]byte(psk))
+	// Derive key using Argon2id (resistant to brute-force on weak PSKs)
+	salt := sha256.Sum256([]byte("MIRAGE-AUTH-SALT-V2"))
+	derived := argon2.IDKey([]byte(psk), salt[:16], 1, 64*1024, 4, 32)
+	var key [32]byte
+	copy(key[:], derived)
 	a := &Auth{
 		key:    key,
 		maxAge: 30 * time.Second,
@@ -55,7 +63,7 @@ func (a *Auth) Generate(userID uint16, sessionID []byte) (string, error) {
 		return "", err
 	}
 
-	ciphertext := gcm.Seal(nil, nonce[:], plaintext, []byte("MIRAGE-AUTH-V1"))
+	ciphertext := gcm.Seal(nil, nonce[:], plaintext, []byte("MIRAGE-AUTH-V2"))
 	out := make([]byte, 12+len(ciphertext))
 	copy(out[0:12], nonce[:])
 	copy(out[12:], ciphertext)
@@ -84,7 +92,7 @@ func (a *Auth) Validate(token string) (uint16, []byte, error) {
 		return 0, nil, err
 	}
 
-	plaintext, err := gcm.Open(nil, nonce[:], raw[12:], []byte("MIRAGE-AUTH-V1"))
+	plaintext, err := gcm.Open(nil, nonce[:], raw[12:], []byte("MIRAGE-AUTH-V2"))
 	if err != nil {
 		return 0, nil, errors.New("decryption failed")
 	}
@@ -99,6 +107,18 @@ func (a *Auth) Validate(token string) (uint16, []byte, error) {
 	defer a.mu.Unlock()
 	if _, exists := a.seen[nonce]; exists {
 		return 0, nil, errors.New("replay detected")
+	}
+	if len(a.seen) >= maxSeenNonces {
+		// Evict oldest entries instead of rejecting legitimate tokens (DoS prevention)
+		now := time.Now()
+		for k, exp := range a.seen {
+			if now.After(exp) || len(a.seen) >= maxSeenNonces {
+				delete(a.seen, k)
+			}
+			if len(a.seen) < maxSeenNonces*9/10 {
+				break // evict ~10%
+			}
+		}
 	}
 	a.seen[nonce] = time.Now().Add(a.maxAge * 2)
 

@@ -1,0 +1,98 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "utun-mirage",
+      "inet4_address": "172.19.0.1/30",
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system",
+      "sniff": true
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "::",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "mirage-out",
+      "server": "127.0.0.1",
+      "server_port": 1080
+    },
+    {
+      "type": "direct",
+      "tag": "direct-out"
+    },
+    {
+      "type": "block",
+      "tag": "block-out"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "outbound": "dns-out"
+      },
+      {
+        "domain": [
+          "sla.sunlawai.com"
+        ],
+        "outbound": "direct-out"
+      },
+      {
+        "geosite": "cn",
+        "outbound": "direct-out"
+      },
+      {
+        "geoip": "cn",
+        "outbound": "direct-out"
+      },
+      {
+        "geoip": "private",
+        "outbound": "direct-out"
+      }
+    ],
+    "final": "mirage-out",
+    "auto_detect_interface": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "remote-dns",
+        "address": "https://dns.google/dns-query",
+        "detour": "mirage-out"
+      },
+      {
+        "tag": "local-dns",
+        "address": "223.5.5.5",
+        "detour": "direct-out"
+      }
+    ],
+    "rules": [
+      {
+        "geosite": "cn",
+        "server": "local-dns"
+      },
+      {
+        "domain": [
+          "sla.sunlawai.com"
+        ],
+        "server": "local-dns"
+      }
+    ],
+    "final": "remote-dns"
+  }
+}
