@@ -22,6 +22,7 @@ import (
 	"github.com/houden/mirage/internal/auth"
 	"github.com/houden/mirage/internal/morph"
 	"github.com/houden/mirage/internal/mux"
+	"github.com/houden/mirage/internal/outbound"
 	"github.com/houden/mirage/internal/relay"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/net/http2"
@@ -47,6 +48,9 @@ type Config struct {
 	RealityServerName string // SNI for REALITY, e.g. "troncent.com"
 	RealityPrivateKey string // x25519 private key (base64)
 	RealityShortID    string // short ID (hex)
+
+	// Outbound proxy (optional — routes proxied traffic through an upstream proxy)
+	Outbound outbound.Dialer
 }
 
 type serverSession struct {
@@ -353,7 +357,15 @@ func (s *Server) handleProxy(st *mux.Stream) {
 	}
 	target := string(targetBuf)
 
-	dest, err := net.DialTimeout("tcp", target, 5*time.Second)
+	var (
+		dest net.Conn
+		err  error
+	)
+	if s.config.Outbound != nil {
+		dest, err = s.config.Outbound.DialTarget(target)
+	} else {
+		dest, err = net.DialTimeout("tcp", target, 5*time.Second)
+	}
 	if err != nil {
 		if s.config.Verbose {
 			log.Printf("dial %s: %v", target, err)

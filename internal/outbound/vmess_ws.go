@@ -1,0 +1,133 @@
+package outbound
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	M "github.com/sagernet/sing/common/metadata"
+	vmess "github.com/sagernet/sing-vmess"
+)
+
+// VMessWSConfig holds VMess+WebSocket outbound configuration.
+type VMessWSConfig struct {
+	Server string // server address (host or IP)
+	Port   uint16 // server port
+	UUID   string // VMess user UUID
+	WSPath string // WebSocket path, e.g. "/relay"
+}
+
+// VMessWSDialer dials targets through a VMess+WebSocket proxy.
+type VMessWSDialer struct {
+	cfg    VMessWSConfig
+	client *vmess.Client
+}
+
+// NewVMessWSDialer creates a new VMess+WS outbound dialer.
+func NewVMessWSDialer(cfg VMessWSConfig) (*VMessWSDialer, error) {
+	client, err := vmess.NewClient(cfg.UUID, "auto", 0)
+	if err != nil {
+		return nil, fmt.Errorf("vmess client init: %w", err)
+	}
+	log.Printf("outbound: vmess-ws → %s:%d%s", cfg.Server, cfg.Port, cfg.WSPath)
+	return &VMessWSDialer{cfg: cfg, client: client}, nil
+}
+
+// DialTarget connects to the target address through the VMess+WS proxy.
+func (d *VMessWSDialer) DialTarget(target string) (net.Conn, error) {
+	// 1. Establish WebSocket connection to the VMess server
+	wsURL := fmt.Sprintf("ws://%s:%d%s", d.cfg.Server, d.cfg.Port, d.cfg.WSPath)
+	wsDialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+	wsRaw, _, err := wsDialer.Dial(wsURL, http.Header{})
+	if err != nil {
+		return nil, fmt.Errorf("ws connect %s: %w", wsURL, err)
+	}
+
+	// 2. Wrap gorilla WebSocket as a net.Conn-compatible stream
+	baseConn := newWSConn(wsRaw)
+
+	// 3. Wrap with VMess protocol — this sends the VMess request header
+	//    containing the target address, and handles encryption.
+	dest := M.ParseSocksaddr(target)
+	vmessConn, err := d.client.DialConn(baseConn, dest)
+	if err != nil {
+		baseConn.Close()
+		return nil, fmt.Errorf("vmess dial %s: %w", target, err)
+	}
+
+	return vmessConn, nil
+}
+
+// wsConn adapts gorilla/websocket.Conn to net.Conn for stream-based I/O.
+type wsConn struct {
+	ws     *websocket.Conn
+	reader io.Reader
+	mu     sync.Mutex // protects writes
+}
+
+func newWSConn(ws *websocket.Conn) *wsConn {
+	return &wsConn{ws: ws}
+}
+
+func (c *wsConn) Read(b []byte) (int, error) {
+	for {
+		if c.reader != nil {
+			n, err := c.reader.Read(b)
+			if n > 0 {
+				return n, nil
+			}
+			if err != io.EOF {
+				return 0, err
+			}
+			c.reader = nil
+		}
+		_, reader, err := c.ws.NextReader()
+		if err != nil {
+			return 0, err
+		}
+		c.reader = reader
+	}
+}
+
+func (c *wsConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ws.WriteMessage(websocket.BinaryMessage, b); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (c *wsConn) Close() error {
+	return c.ws.Close()
+}
+
+func (c *wsConn) LocalAddr() net.Addr {
+	return c.ws.LocalAddr()
+}
+
+func (c *wsConn) RemoteAddr() net.Addr {
+	return c.ws.RemoteAddr()
+}
+
+func (c *wsConn) SetDeadline(t time.Time) error {
+	if err := c.ws.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.ws.SetWriteDeadline(t)
+}
+
+func (c *wsConn) SetReadDeadline(t time.Time) error {
+	return c.ws.SetReadDeadline(t)
+}
+
+func (c *wsConn) SetWriteDeadline(t time.Time) error {
+	return c.ws.SetWriteDeadline(t)
+}
