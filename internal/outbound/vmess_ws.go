@@ -40,21 +40,19 @@ func NewVMessWSDialer(cfg VMessWSConfig) (*VMessWSDialer, error) {
 
 // DialTarget connects to the target address through the VMess+WS proxy.
 func (d *VMessWSDialer) DialTarget(target string) (net.Conn, error) {
-	// 1. Establish WebSocket connection to the VMess server
 	wsURL := fmt.Sprintf("ws://%s:%d%s", d.cfg.Server, d.cfg.Port, d.cfg.WSPath)
 	wsDialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
+		ReadBufferSize:   4096,
+		WriteBufferSize:  4096,
 	}
 	wsRaw, _, err := wsDialer.Dial(wsURL, http.Header{})
 	if err != nil {
 		return nil, fmt.Errorf("ws connect %s: %w", wsURL, err)
 	}
 
-	// 2. Wrap gorilla WebSocket as a net.Conn-compatible stream
 	baseConn := newWSConn(wsRaw)
 
-	// 3. Wrap with VMess protocol — this sends the VMess request header
-	//    containing the target address, and handles encryption.
 	dest := M.ParseSocksaddr(target)
 	vmessConn, err := d.client.DialConn(baseConn, dest)
 	if err != nil {
@@ -62,18 +60,31 @@ func (d *VMessWSDialer) DialTarget(target string) (net.Conn, error) {
 		return nil, fmt.Errorf("vmess dial %s: %w", target, err)
 	}
 
-	return &halfCloseConn{vmessConn}, nil
+	return &halfCloseConn{Conn: vmessConn, ws: baseConn}, nil
 }
 
-// halfCloseConn wraps a net.Conn to provide a no-op CloseWrite,
-// preventing relay.Bidirectional from closing the entire connection
-// when one direction finishes copying.
+// halfCloseConn wraps a net.Conn to provide CloseWrite that signals
+// the underlying WebSocket to stop, preventing goroutine leaks in
+// relay.Bidirectional.
 type halfCloseConn struct {
 	net.Conn
+	ws       *wsConn
+	once     sync.Once
+	writeDone bool
 }
 
 func (c *halfCloseConn) CloseWrite() error {
-	return nil // no-op — let Close() handle full teardown
+	c.writeDone = true
+	return nil
+}
+
+func (c *halfCloseConn) Close() error {
+	var err error
+	c.once.Do(func() {
+		err = c.Conn.Close()
+		c.ws.Close()
+	})
+	return err
 }
 
 // wsConn adapts gorilla/websocket.Conn to net.Conn for stream-based I/O.
@@ -81,9 +92,13 @@ type wsConn struct {
 	ws     *websocket.Conn
 	reader io.Reader
 	mu     sync.Mutex // protects writes
+	closed bool
 }
 
 func newWSConn(ws *websocket.Conn) *wsConn {
+	// Set a generous read deadline to prevent indefinite hangs.
+	// Each successful read resets it.
+	ws.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	return &wsConn{ws: ws}
 }
 
@@ -92,6 +107,8 @@ func (c *wsConn) Read(b []byte) (int, error) {
 		if c.reader != nil {
 			n, err := c.reader.Read(b)
 			if n > 0 {
+				// Reset read deadline on successful read
+				c.ws.SetReadDeadline(time.Now().Add(5 * time.Minute))
 				return n, nil
 			}
 			if err != io.EOF {
@@ -110,6 +127,10 @@ func (c *wsConn) Read(b []byte) (int, error) {
 func (c *wsConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	c.ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	if err := c.ws.WriteMessage(websocket.BinaryMessage, b); err != nil {
 		return 0, err
 	}
@@ -117,6 +138,9 @@ func (c *wsConn) Write(b []byte) (int, error) {
 }
 
 func (c *wsConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
 	return c.ws.Close()
 }
 
