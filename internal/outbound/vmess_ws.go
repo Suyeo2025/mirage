@@ -62,7 +62,18 @@ func (d *VMessWSDialer) DialTarget(target string) (net.Conn, error) {
 		return nil, fmt.Errorf("vmess dial %s: %w", target, err)
 	}
 
-	return vmessConn, nil
+	return &halfCloseConn{vmessConn}, nil
+}
+
+// halfCloseConn wraps a net.Conn to provide a no-op CloseWrite,
+// preventing relay.Bidirectional from closing the entire connection
+// when one direction finishes copying.
+type halfCloseConn struct {
+	net.Conn
+}
+
+func (c *halfCloseConn) CloseWrite() error {
+	return nil // no-op — let Close() handle full teardown
 }
 
 // wsConn adapts gorilla/websocket.Conn to net.Conn for stream-based I/O.
