@@ -28,6 +28,19 @@ mirage-server \
   --reality-short-id <hex-short-id> \
   --listen :9445
 
+# With VMess+WS outbound (non-landing, traffic exits via upstream proxy)
+mirage-server \
+  --domain example.com \
+  --psk <pre-shared-key> \
+  --reality-dest troncent.com:443 \
+  --reality-sni troncent.com \
+  --reality-private-key <base64-x25519-private-key> \
+  --reality-short-id <hex-short-id> \
+  --listen :9445 \
+  --outbound-server <vmess-host>:<port> \
+  --outbound-uuid <vmess-uuid> \
+  --outbound-ws-path /relay
+
 # Let's Encrypt mode
 mirage-server --domain example.com --psk <key> --listen :443
 
@@ -84,7 +97,7 @@ Route server IP to direct (bypass tun):
 
 ```
 SOCKS5 Client → Mux (7-byte framing) → Morph Engine (Gaussian padding + split + decoy)
-    → HTTP/2 Carrier (50ms RTT-quantized flush) → REALITY TLS → Server → TCP relay
+    → HTTP/2 Carrier (50ms RTT-quantized flush) → REALITY TLS → Server → TCP relay / VMess+WS outbound
 ```
 
 ## Security
