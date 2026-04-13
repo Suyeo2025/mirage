@@ -42,6 +42,8 @@ type ClientCarrier struct {
 	downstreamW *io.PipeWriter // carrier writes here ← GET response → mux reads
 	ctx         context.Context
 	cancel      context.CancelFunc
+	buildDialTLS func() func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error)
+	mu           sync.Mutex
 }
 
 type ClientCarrierConfig struct {
@@ -61,10 +63,12 @@ type ClientCarrierConfig struct {
 func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	dialTLS := buildTLSDialer(cfg)
+	buildDialer := func() func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+		return buildTLSDialer(cfg)
+	}
 
 	h2tr := &http2.Transport{
-		DialTLSContext: dialTLS,
+		DialTLSContext:     buildDialer(),
 		DisableCompression: true,
 	}
 
@@ -72,9 +76,6 @@ func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 	if userID == 0 {
 		userID = 1
 	}
-	// When RealitySNI is set and ServerAddr is an IP, use SNI as the URL hostname
-	// so TLS certificate validation uses the domain name, while DialTLS connects
-	// to the actual IP (handled by buildTLSDialer).
 	serverURL := "https://" + cfg.ServerAddr
 	if cfg.RealitySNI != "" {
 		_, port, _ := net.SplitHostPort(cfg.ServerAddr)
@@ -85,15 +86,30 @@ func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 		}
 	}
 	return &ClientCarrier{
-		serverURL:   serverURL,
-		auth:        cfg.Auth,
-		sessionID:   cfg.SessionID,
-		userID:      userID,
-		client:      &http.Client{Transport: h2tr},
-		upstream:    cfg.Upstream,
-		downstreamW: cfg.DownstreamW,
-		ctx:         ctx,
-		cancel:      cancel,
+		serverURL:    serverURL,
+		auth:         cfg.Auth,
+		sessionID:    cfg.SessionID,
+		userID:       userID,
+		client:       &http.Client{Transport: h2tr},
+		upstream:     cfg.Upstream,
+		downstreamW:  cfg.DownstreamW,
+		ctx:          ctx,
+		cancel:       cancel,
+		buildDialTLS: buildDialer,
+	}
+}
+
+// resetTransport closes the stale HTTP/2 transport and creates a fresh one.
+func (c *ClientCarrier) resetTransport() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	log.Printf("carrier: resetting HTTP/2 transport")
+	if tr, ok := c.client.Transport.(*http2.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+	c.client.Transport = &http2.Transport{
+		DialTLSContext:     c.buildDialTLS(),
+		DisableCompression: true,
 	}
 }
 
@@ -201,6 +217,8 @@ func (c *ClientCarrier) upstreamLoop() {
 	keepalive := time.NewTimer(keepaliveInterval())
 	defer keepalive.Stop()
 
+	var consecutiveErrors int
+
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -212,20 +230,38 @@ func (c *ClientCarrier) upstreamLoop() {
 				continue
 			}
 			if err := c.sendPost(data); err != nil {
-				log.Printf("carrier up: %v", err)
+				consecutiveErrors++
+				log.Printf("carrier up: %v (errors=%d)", err, consecutiveErrors)
+				if consecutiveErrors >= 3 {
+					c.resetTransport()
+					consecutiveErrors = 0
+				}
 				time.Sleep(200 * time.Millisecond)
+			} else {
+				consecutiveErrors = 0
 			}
 			keepalive.Reset(keepaliveInterval())
 		case <-keepalive.C:
 			// Idle keepalive
-			c.sendPost(nil)
+			if err := c.sendPost(nil); err != nil {
+				consecutiveErrors++
+				if consecutiveErrors >= 3 {
+					c.resetTransport()
+					consecutiveErrors = 0
+				}
+			} else {
+				consecutiveErrors = 0
+			}
 			keepalive.Reset(keepaliveInterval())
 		}
 	}
 }
 
 func (c *ClientCarrier) sendPost(data []byte) error {
-	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost,
+	postCtx, cancel := context.WithTimeout(c.ctx, 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(postCtx, http.MethodPost,
 		c.serverURL+"/api/v2/tunnel", bytes.NewReader(data))
 	if err != nil {
 		return err
