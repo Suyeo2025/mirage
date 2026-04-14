@@ -70,6 +70,8 @@ func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 	h2tr := &http2.Transport{
 		DialTLSContext:     buildDialer(),
 		DisableCompression: true,
+		ReadIdleTimeout:    15 * time.Second, // send PING after 15s idle
+		PingTimeout:        5 * time.Second,  // close conn if no PONG in 5s
 	}
 
 	userID := cfg.UserID
@@ -110,6 +112,8 @@ func (c *ClientCarrier) resetTransport() {
 	c.client.Transport = &http2.Transport{
 		DialTLSContext:     c.buildDialTLS(),
 		DisableCompression: true,
+		ReadIdleTimeout:    15 * time.Second,
+		PingTimeout:        5 * time.Second,
 	}
 }
 
