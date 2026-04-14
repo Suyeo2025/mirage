@@ -135,7 +135,7 @@ func buildTLSDialer(cfg ClientCarrierConfig) func(ctx context.Context, network, 
 			if cfg.RealitySNI != "" && host == cfg.RealitySNI {
 				dialTarget = realDialAddr
 			}
-			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 			conn, err := dialer.DialContext(ctx, network, dialTarget)
 			if err != nil {
 				return nil, err
@@ -162,7 +162,7 @@ func buildTLSDialer(cfg ClientCarrierConfig) func(ctx context.Context, network, 
 		if cfg.RealitySNI != "" && host == cfg.RealitySNI {
 			actualAddr = dialAddr
 		}
-		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 		conn, err := dialer.DialContext(ctx, network, actualAddr)
 		if err != nil {
 			return nil, err
