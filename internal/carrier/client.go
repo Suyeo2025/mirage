@@ -283,13 +283,21 @@ func (c *ClientCarrier) sendPost(data []byte) error {
 
 // downstreamLoop: persistent GET, streams response to downstreamW.
 func (c *ClientCarrier) downstreamLoop() {
+	var consecutiveErrors int
 	for {
 		if c.ctx.Err() != nil {
 			return
 		}
 		if err := c.openGet(); err != nil {
-			log.Printf("carrier down: %v", err)
+			consecutiveErrors++
+			log.Printf("carrier down: %v (errors=%d)", err, consecutiveErrors)
+			if consecutiveErrors >= 3 {
+				c.resetTransport()
+				consecutiveErrors = 0
+			}
 			time.Sleep(300 * time.Millisecond)
+		} else {
+			consecutiveErrors = 0
 		}
 	}
 }
@@ -318,6 +326,12 @@ func (c *ClientCarrier) openGet() error {
 		io.Copy(io.Discard, resp.Body)
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
+
+	// Force-close resp.Body when context expires, unblocking io.Copy.
+	go func() {
+		<-connCtx.Done()
+		resp.Body.Close()
+	}()
 
 	// Stream response body directly to mux downstream
 	start := time.Now()
