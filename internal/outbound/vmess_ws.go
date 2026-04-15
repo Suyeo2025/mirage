@@ -14,6 +14,18 @@ import (
 	vmess "github.com/sagernet/sing-vmess"
 )
 
+const (
+	// idleTimeout is how long a connection can be idle (no data read)
+	// before it's closed. Active connections reset this on every read.
+	idleTimeout = 60 * time.Second
+
+	// drainTimeout is how long the read side gets to finish after the
+	// write side is done (CloseWrite called). This covers the gap where
+	// VMess/WS can't do half-close: the target doesn't know we're done
+	// sending, so we give it this long to finish its response.
+	drainTimeout = 30 * time.Second
+)
+
 // VMessWSConfig holds VMess+WebSocket outbound configuration.
 type VMessWSConfig struct {
 	Server string // server address (host or IP)
@@ -63,18 +75,22 @@ func (d *VMessWSDialer) DialTarget(target string) (net.Conn, error) {
 	return &halfCloseConn{Conn: vmessConn, ws: baseConn}, nil
 }
 
-// halfCloseConn wraps a net.Conn to provide CloseWrite that signals
-// the underlying WebSocket to stop, preventing goroutine leaks in
-// relay.Bidirectional.
+// halfCloseConn wraps a net.Conn to handle the fact that VMess+WS
+// doesn't support TCP half-close. When relay.Bidirectional finishes
+// one direction and calls CloseWrite, we set a short read deadline
+// to give the other direction time to finish, then clean up.
 type halfCloseConn struct {
 	net.Conn
-	ws       *wsConn
-	once     sync.Once
-	writeDone bool
+	ws   *wsConn
+	once sync.Once
 }
 
 func (c *halfCloseConn) CloseWrite() error {
-	c.writeDone = true
+	// The write side is done (client finished sending). VMess/WS can't
+	// signal half-close, so set a deadline for the read side to finish.
+	// Active reads (data still flowing) will complete before this deadline.
+	// Idle reads (target not responding) will timeout and unblock the relay.
+	c.ws.setIdleTimeout(drainTimeout)
 	return nil
 }
 
@@ -93,13 +109,18 @@ type wsConn struct {
 	reader io.Reader
 	mu     sync.Mutex // protects writes
 	closed bool
+	idle   time.Duration // current idle timeout
 }
 
 func newWSConn(ws *websocket.Conn) *wsConn {
-	// Set a generous read deadline to prevent indefinite hangs.
-	// Each successful read resets it.
-	ws.SetReadDeadline(time.Now().Add(5 * time.Minute))
-	return &wsConn{ws: ws}
+	ws.SetReadDeadline(time.Now().Add(idleTimeout))
+	return &wsConn{ws: ws, idle: idleTimeout}
+}
+
+// setIdleTimeout changes the idle timeout. Next read will use the new value.
+func (c *wsConn) setIdleTimeout(d time.Duration) {
+	c.idle = d
+	c.ws.SetReadDeadline(time.Now().Add(d))
 }
 
 func (c *wsConn) Read(b []byte) (int, error) {
@@ -107,8 +128,8 @@ func (c *wsConn) Read(b []byte) (int, error) {
 		if c.reader != nil {
 			n, err := c.reader.Read(b)
 			if n > 0 {
-				// Reset read deadline on successful read
-				c.ws.SetReadDeadline(time.Now().Add(5 * time.Minute))
+				// Reset idle deadline on successful read — active connections stay alive
+				c.ws.SetReadDeadline(time.Now().Add(c.idle))
 				return n, nil
 			}
 			if err != io.EOF {
