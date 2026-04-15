@@ -19,11 +19,6 @@ const (
 	// before it's closed. Active connections reset this on every read.
 	idleTimeout = 60 * time.Second
 
-	// drainTimeout is how long the read side gets to finish after the
-	// write side is done (CloseWrite called). This covers the gap where
-	// VMess/WS can't do half-close: the target doesn't know we're done
-	// sending, so we give it this long to finish its response.
-	drainTimeout = 30 * time.Second
 )
 
 // VMessWSConfig holds VMess+WebSocket outbound configuration.
@@ -75,10 +70,9 @@ func (d *VMessWSDialer) DialTarget(target string) (net.Conn, error) {
 	return &halfCloseConn{Conn: vmessConn, ws: baseConn}, nil
 }
 
-// halfCloseConn wraps a net.Conn to handle the fact that VMess+WS
-// doesn't support TCP half-close. When relay.Bidirectional finishes
-// one direction and calls CloseWrite, we set a short read deadline
-// to give the other direction time to finish, then clean up.
+// halfCloseConn wraps a net.Conn that doesn't support TCP half-close
+// (VMess+WS). CloseWrite is a no-op — relay.Bidirectional's built-in
+// grace timer (30s) handles cleanup by force-closing both sides.
 type halfCloseConn struct {
 	net.Conn
 	ws   *wsConn
@@ -86,12 +80,7 @@ type halfCloseConn struct {
 }
 
 func (c *halfCloseConn) CloseWrite() error {
-	// The write side is done (client finished sending). VMess/WS can't
-	// signal half-close, so set a deadline for the read side to finish.
-	// Active reads (data still flowing) will complete before this deadline.
-	// Idle reads (target not responding) will timeout and unblock the relay.
-	c.ws.setIdleTimeout(drainTimeout)
-	return nil
+	return nil // relay's grace timer handles cleanup
 }
 
 func (c *halfCloseConn) Close() error {
@@ -115,12 +104,6 @@ type wsConn struct {
 func newWSConn(ws *websocket.Conn) *wsConn {
 	ws.SetReadDeadline(time.Now().Add(idleTimeout))
 	return &wsConn{ws: ws, idle: idleTimeout}
-}
-
-// setIdleTimeout changes the idle timeout. Next read will use the new value.
-func (c *wsConn) setIdleTimeout(d time.Duration) {
-	c.idle = d
-	c.ws.SetReadDeadline(time.Now().Add(d))
 }
 
 func (c *wsConn) Read(b []byte) (int, error) {

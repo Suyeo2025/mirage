@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"time"
@@ -54,8 +53,11 @@ func (c *Client) Run(ctx context.Context) error {
 	// upstream: mux writes frames → BufPipe (never blocks) → carrier reads → POST
 	upstream := mux.NewBufPipe()
 
-	// downstream: carrier writes from GET response → io.Pipe → mux reads frames
-	downR, downW := io.Pipe()
+	// downstream: carrier writes from GET response → BufPipe → mux reads frames
+	// BufPipe (non-blocking writes) decouples the carrier from the mux RecvLoop.
+	// With io.Pipe, a slow RecvLoop would block the carrier's Write, killing
+	// the entire downstream. BufPipe absorbs bursts and never blocks the writer.
+	downstream := mux.NewBufPipe()
 
 	// mux session writes upstream frames to BufPipe
 	sess := mux.NewSession(upstream)
@@ -83,16 +85,16 @@ func (c *Client) Run(ctx context.Context) error {
 		SessionID:        c.sessionID,
 		UserID:           c.config.UserID,
 		Upstream:         upstream,
-		DownstreamW:      downW,
+		DownstreamW:      downstream,
 		RealityPublicKey: c.config.RealityPublicKey,
 		RealityShortID:   c.config.RealityShortID,
 		RealitySNI:       c.config.RealitySNI,
 	})
 	go car.Run()
 
-	// mux reads downstream frames from pipe
+	// mux reads downstream frames from BufPipe
 	go func() {
-		if err := sess.RecvLoop(downR); err != nil {
+		if err := sess.RecvLoop(downstream); err != nil {
 			log.Printf("mux recv: %v", err)
 		}
 	}()

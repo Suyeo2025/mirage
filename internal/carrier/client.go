@@ -38,8 +38,8 @@ type ClientCarrier struct {
 	sessionID   []byte
 	userID      uint16
 	client      *http.Client
-	upstream    *mux.BufPipe   // mux writes here → carrier reads → POST
-	downstreamW *io.PipeWriter // carrier writes here ← GET response → mux reads
+	upstream    *mux.BufPipe // mux writes here → carrier reads → POST
+	downstreamW io.Writer   // carrier writes here ← GET response → mux reads
 	ctx         context.Context
 	cancel      context.CancelFunc
 	buildDialTLS func() func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error)
@@ -52,7 +52,7 @@ type ClientCarrierConfig struct {
 	SessionID   []byte
 	UserID      uint16
 	Upstream    *mux.BufPipe   // mux session writes frames here
-	DownstreamW *io.PipeWriter // carrier writes received frames here
+	DownstreamW io.Writer // carrier writes received frames here
 
 	// REALITY config (optional). When PublicKey is set, uses reality.Client().
 	RealityPublicKey string // x25519 public key (base64)
