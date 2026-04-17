@@ -568,7 +568,13 @@ func (s *Server) sessionReaper(ctx context.Context) {
 			s.mu.Lock()
 			now := time.Now().Unix()
 			for key, ss := range s.sessions {
-				if now-ss.lastActive.Load() > 300 { // 5 minutes
+				// 1 hour of idle before reaping. Previously 5 min, which
+				// was too aggressive: any network disruption longer than 5
+				// min (sing-box restart plus flapping, ISP blip, etc.)
+				// would cause the session to be reaped, and when the client
+				// eventually reconnected its upAckedOff would no longer
+				// match the server's reset upRecv → 410 storm.
+				if now-ss.lastActive.Load() > 3600 {
 					ss.cancelDownHandler() // kick any in-flight GET handler
 					ss.sess.Close()
 					ss.downstream.Close()

@@ -397,6 +397,17 @@ func (c *ClientCarrier) sendPost(data []byte, off uint64) error {
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode == http.StatusGone {
+		// 410 = server says our byte-stream offset is ahead of its session
+		// state. The two ways this happens (server process restart, server
+		// reaped our session for idle) both leave the mux layer in an
+		// unrecoverable state: the old mux byte stream encoded streams /
+		// frames that the server no longer knows about, so we can't just
+		// reset upAckedOff and resume. Simplest correct recovery is to
+		// exit — systemd restarts us with a fresh sessionID + fresh mux.
+		// In-flight SOCKS5 connections die but reconnect transparently.
+		log.Fatalf("carrier: server rejected session with 410 — exiting for systemd restart")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
