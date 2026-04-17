@@ -16,9 +16,11 @@ import (
 
 const (
 	// idleTimeout is how long a connection can be idle (no data read)
-	// before it's closed. Active connections reset this on every read.
-	idleTimeout = 60 * time.Second
-
+	// before it's closed. 5 minutes matches TCP keepalive defaults and
+	// accommodates upload-heavy flows (ssh sessions, long uploads) where
+	// the server sends little data for extended periods. Active reads
+	// reset this on every successful read.
+	idleTimeout = 300 * time.Second
 )
 
 // VMessWSConfig holds VMess+WebSocket outbound configuration.

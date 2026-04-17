@@ -19,6 +19,7 @@ type Auth struct {
 	maxAge time.Duration
 	mu     sync.Mutex
 	seen   map[[12]byte]time.Time
+	done   chan struct{}
 }
 
 const maxSeenNonces = 100_000
@@ -30,12 +31,25 @@ func New(psk string) *Auth {
 	var key [32]byte
 	copy(key[:], derived)
 	a := &Auth{
-		key:    key,
-		maxAge: 30 * time.Second,
+		key: key,
+		// 90s window — tolerates the clock skew that caused the original
+		// 401 storm. Replay protection still catches reuse within the
+		// window via seen[nonce].
+		maxAge: 90 * time.Second,
 		seen:   make(map[[12]byte]time.Time),
+		done:   make(chan struct{}),
 	}
 	go a.cleanupLoop()
 	return a
+}
+
+// Close stops the background cleanup goroutine. Idempotent.
+func (a *Auth) Close() {
+	select {
+	case <-a.done:
+	default:
+		close(a.done)
+	}
 }
 
 // Generate creates an auth token. Format:
@@ -130,14 +144,20 @@ func (a *Auth) Validate(token string) (uint16, []byte, error) {
 
 func (a *Auth) cleanupLoop() {
 	ticker := time.NewTicker(60 * time.Second)
-	for range ticker.C {
-		a.mu.Lock()
-		now := time.Now()
-		for k, exp := range a.seen {
-			if now.After(exp) {
-				delete(a.seen, k)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.done:
+			return
+		case <-ticker.C:
+			a.mu.Lock()
+			now := time.Now()
+			for k, exp := range a.seen {
+				if now.After(exp) {
+					delete(a.seen, k)
+				}
 			}
+			a.mu.Unlock()
 		}
-		a.mu.Unlock()
 	}
 }

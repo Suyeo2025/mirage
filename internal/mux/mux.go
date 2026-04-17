@@ -290,6 +290,12 @@ type Stream struct {
 	cur     []byte     // current partially-read chunk
 	closed  atomic.Bool
 
+	// done is closed exactly once when the stream is torn down (local Close
+	// or remote CmdFIN). Used to unblock pushData and Read without having to
+	// close readBuf (which would race with a concurrent send and panic).
+	done     chan struct{}
+	doneOnce sync.Once
+
 	// Flow control: send side
 	sendWnd   atomic.Int64  // remaining send window (bytes)
 	sendWndCh chan struct{} // signaled when window opens up
@@ -308,11 +314,23 @@ func newStream(id uint32, sess *Session) *Stream {
 		id:        id,
 		sess:      sess,
 		readBuf:   make(chan []byte, 256), // larger buffer to reduce drops
+		done:      make(chan struct{}),
 		sendWndCh: make(chan struct{}, 1),
 		created:   time.Now(),
 	}
 	st.sendWnd.Store(maxWindow) // start unlimited (legacy compat)
 	return st
+}
+
+// markDone closes the done channel exactly once, unblocking any Read or
+// pushData waiters. Safe to call multiple times and safe when st.done is nil
+// (supports tests that build Stream literals without newStream).
+func (st *Stream) markDone() {
+	st.doneOnce.Do(func() {
+		if st.done != nil {
+			close(st.done)
+		}
+	})
 }
 
 func (st *Stream) Read(p []byte) (int, error) {
@@ -323,26 +341,47 @@ func (st *Stream) Read(p []byte) (int, error) {
 			st.cur = st.cur[n:]
 
 			// Track consumed bytes for flow control.
-			// Use atomic add; send window update when threshold reached.
+			// CAS loop so concurrent readers cannot clobber each other's
+			// threshold check: each consumer either "wins" the reset and
+			// sends the WND update, or sees the reset-below-threshold state
+			// and leaves the next window update to whoever crosses next.
 			if st.flowCtrl.Load() {
-				consumed := st.recvConsumed.Add(int64(n))
-				if consumed >= initialWindow/4 {
-					// Reset counter atomically — if another reader already reset,
-					// this will go negative briefly but self-corrects.
-					st.recvConsumed.Store(0)
-					st.sess.sendWindowUpdate(st.id, consumed)
+				st.recvConsumed.Add(int64(n))
+				for {
+					cur := st.recvConsumed.Load()
+					if cur < initialWindow/4 {
+						break
+					}
+					if st.recvConsumed.CompareAndSwap(cur, 0) {
+						st.sess.sendWindowUpdate(st.id, cur)
+						break
+					}
 				}
 			}
 
 			return n, nil
 		}
 
-		// Wait for next chunk
-		chunk, ok := <-st.readBuf
-		if !ok || chunk == nil {
+		// Wait for next chunk, or for the stream to be torn down.
+		select {
+		case chunk, ok := <-st.readBuf:
+			if !ok || chunk == nil {
+				return 0, io.EOF
+			}
+			st.cur = chunk
+		case <-st.done:
+			// Stream closed. Deliver any remaining buffered chunk before EOF
+			// so that data in flight at close time is not lost.
+			select {
+			case chunk, ok := <-st.readBuf:
+				if ok && chunk != nil {
+					st.cur = chunk
+					continue
+				}
+			default:
+			}
 			return 0, io.EOF
 		}
-		st.cur = chunk
 	}
 }
 
@@ -386,6 +425,11 @@ func (st *Stream) Close() error {
 	}
 	st.sess.writeFrame(CmdFIN, st.id, nil)
 	st.sess.removeStream(st.id)
+	// Unblock any paired Read goroutine waiting on readBuf.
+	// Without this, relay.Bidirectional's other copy leg hangs forever when
+	// the local side closes first — the core reason the server leaked 500+
+	// goroutines over a 9-hour uptime.
+	st.markDone()
 	// Unblock ALL writers waiting on send window (loop to drain)
 	for {
 		select {
@@ -396,21 +440,27 @@ func (st *Stream) Close() error {
 	}
 }
 
+// pushData delivers one data frame to the local reader. It blocks until the
+// reader makes room OR the stream is closed. The previous implementation
+// silently dropped data after a 50ms timeout, which caused inner-TLS
+// "bad record mac" errors under load because mux is supposed to provide a
+// reliable byte stream. Blocking here back-pressures the mux RecvLoop
+// (and therefore the HTTP/2 POST body read) instead — which is what the
+// outer transport is designed to handle.
 func (st *Stream) pushData(data []byte) {
 	select {
 	case st.readBuf <- data:
-	default:
-		// Buffer full — block briefly then drop if still full.
-		// This is better than the old silent drop but still prevents deadlock.
-		select {
-		case st.readBuf <- data:
-		case <-time.After(50 * time.Millisecond):
-		}
+	case <-st.done:
+		// Stream was torn down while we were trying to deliver. Drop silently
+		// — there is no reader left to care.
 	}
 }
 
+// pushEOF signals end-of-stream to the local reader. Does not close readBuf
+// (that would race with concurrent pushData sends and panic); instead closes
+// the done channel via markDone, which both Read and pushData select on.
 func (st *Stream) pushEOF() {
-	close(st.readBuf)
+	st.markDone()
 }
 
 func (st *Stream) addSendWindow(delta int64) {
