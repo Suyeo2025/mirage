@@ -8,9 +8,17 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/houden/mirage/internal/mux"
 )
+
+// udpRelayIdleTimeout bounds the lifetime of a UDP relay with no datagrams
+// in either direction. Matches the client-side limit; primarily a
+// defence-in-depth so server-side goroutines cannot accumulate even if
+// the client's own teardown path is ever broken.
+const udpRelayIdleTimeout = 3 * time.Minute
 
 // handleUDPRelay terminates a mux stream whose target is "udp:" — framed
 // UDP datagrams flow both ways on the stream, each carrying its own
@@ -46,6 +54,28 @@ func (s *Server) handleUDPRelay(st *mux.Stream) {
 		st.Close()
 	}()
 
+	// Idle-timeout watchdog: if no datagram has flowed in either direction
+	// for udpRelayIdleTimeout, force the relay down. Guards against zombie
+	// relays accumulating if the client-side teardown ever misses us.
+	var lastAct atomic.Int64
+	lastAct.Store(time.Now().UnixNano())
+	touch := func() { lastAct.Store(time.Now().UnixNano()) }
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-ticker.C:
+				if now.UnixNano()-lastAct.Load() > int64(udpRelayIdleTimeout) {
+					closeDone()
+					return
+				}
+			}
+		}
+	}()
+
 	// mux → udp: read framed packets, send to each declared target.
 	go func() {
 		defer closeDone()
@@ -54,6 +84,7 @@ func (s *Server) handleUDPRelay(st *mux.Stream) {
 			if err != nil {
 				return
 			}
+			touch()
 			targetAddr, data, perr := parseAddrAndData(body)
 			if perr != nil {
 				continue
@@ -76,6 +107,7 @@ func (s *Server) handleUDPRelay(st *mux.Stream) {
 			if err != nil {
 				return
 			}
+			touch()
 			udpAddr, ok := addr.(*net.UDPAddr)
 			if !ok {
 				continue

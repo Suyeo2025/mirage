@@ -7,9 +7,20 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/houden/mirage/internal/mux"
 )
+
+// udpIdleTimeout is how long a UDP ASSOCIATE can sit with zero datagrams in
+// either direction before we tear it down. SOCKS5 nominally ties the
+// lifetime of the association to the TCP control connection, but apps that
+// crash or lose their network without cleanly closing TCP leave goroutines
+// pinned forever. An idle timeout is the safety net: accumulated zombie
+// associations used to starve the mux and eventually block new SOCKS5
+// connections at OpenStream.
+const udpIdleTimeout = 3 * time.Minute
 
 // udpMarker is the target prefix that tells the server this mux stream
 // carries framed UDP datagrams instead of a raw TCP byte stream. Must match
@@ -74,12 +85,40 @@ func (c *Client) handleUDPAssociate(sess *mux.Session, conn net.Conn) error {
 	var once sync.Once
 	closeDone := func() { once.Do(func() { close(done) }) }
 
-	// The TCP control connection is the association's lifetime. When the
-	// app closes it we tear the UDP side down so both ends stop leaking
-	// goroutines and sockets.
+	// Last-activity watchdog. Any datagram in either direction updates this;
+	// if it stays stale for udpIdleTimeout we force the association down.
+	// Without this, a zombie association (app crashed, TCP never closed)
+	// keeps ~3 goroutines plus a mux.Stream pinned forever, and enough of
+	// them accumulated will pin so much replay buffer that new SOCKS5
+	// connections block at OpenStream.
+	var lastAct atomic.Int64
+	lastAct.Store(time.Now().UnixNano())
+	touch := func() { lastAct.Store(time.Now().UnixNano()) }
+
+	// The TCP control connection is the association's primary lifetime
+	// signal — when the app closes it, tear everything down.
 	go func() {
 		io.Copy(io.Discard, conn)
 		closeDone()
+	}()
+
+	// Idle-timeout watchdog: polls last-activity and fires closeDone when
+	// the association has been silent too long. Exits early if closeDone
+	// already happened.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-ticker.C:
+				if now.UnixNano()-lastAct.Load() > int64(udpIdleTimeout) {
+					closeDone()
+					return
+				}
+			}
+		}
 	}()
 
 	// UDP listener → mux stream.
@@ -91,6 +130,7 @@ func (c *Client) handleUDPAssociate(sess *mux.Session, conn net.Conn) error {
 			if err != nil {
 				return
 			}
+			touch()
 			clientAddrMu.Lock()
 			if clientAddr == nil {
 				clientAddr = srcAddr
@@ -119,6 +159,7 @@ func (c *Client) handleUDPAssociate(sess *mux.Session, conn net.Conn) error {
 			if err != nil {
 				return
 			}
+			touch()
 			clientAddrMu.Lock()
 			ca := clientAddr
 			clientAddrMu.Unlock()
