@@ -132,39 +132,58 @@ func (c *Client) Run(ctx context.Context) error {
 func (c *Client) handleConn(sess *mux.Session, conn net.Conn) {
 	defer conn.Close()
 
-	target, err := handleSocks5(conn)
+	cmd, target, err := handleSocks5(conn)
 	if err != nil {
 		log.Printf("socks5: %v", err)
 		return
 	}
 
-	stream, err := sess.OpenStream()
-	if err != nil {
-		log.Printf("open stream: %v", err)
-		return
+	switch cmd {
+	case 0x01: // CONNECT — classic TCP relay over mux.
+		stream, err := sess.OpenStream()
+		if err != nil {
+			log.Printf("open stream: %v", err)
+			return
+		}
+		defer stream.Close()
+
+		targetBytes := []byte(target)
+		var lenBuf [2]byte
+		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(targetBytes)))
+		stream.Write(lenBuf[:])
+		stream.Write(targetBytes)
+
+		relay.Bidirectional(conn, stream)
+
+	case 0x03: // UDP ASSOCIATE — spawn a UDP relay per the SOCKS5 spec.
+		if err := c.handleUDPAssociate(sess, conn); err != nil {
+			log.Printf("udp associate: %v", err)
+		}
+
+	default:
+		log.Printf("socks5: unsupported cmd %d", cmd)
 	}
-	defer stream.Close()
-
-	targetBytes := []byte(target)
-	var lenBuf [2]byte
-	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(targetBytes)))
-	stream.Write(lenBuf[:])
-	stream.Write(targetBytes)
-
-	relay.Bidirectional(conn, stream)
 }
 
-func handleSocks5(conn net.Conn) (string, error) {
+// handleSocks5 performs the SOCKS5 method negotiation + request parse, writes
+// the initial negotiation reply, and returns the requested CMD and (for
+// CONNECT) the target. The request reply itself is NOT written — the caller
+// is responsible for sending the appropriate reply once it knows what bind
+// endpoint to advertise (different between CONNECT and UDP ASSOCIATE).
+func handleSocks5(conn net.Conn) (byte, string, error) {
 	buf := make([]byte, 258)
 	n, err := conn.Read(buf)
 	if err != nil || n < 2 || buf[0] != 0x05 {
-		return "", fmt.Errorf("bad greeting")
+		return 0, "", fmt.Errorf("bad greeting")
 	}
 	conn.Write([]byte{0x05, 0x00})
 	n, err = conn.Read(buf)
-	if err != nil || n < 7 || buf[1] != 0x01 {
-		return "", fmt.Errorf("bad request")
+	if err != nil || n < 7 {
+		return 0, "", fmt.Errorf("short request")
 	}
+	cmd := buf[1]
+
+	// Parse DST.ADDR / DST.PORT (used by CONNECT; ignored / zero for UDP).
 	var target string
 	switch buf[3] {
 	case 0x01:
@@ -172,16 +191,25 @@ func handleSocks5(conn net.Conn) (string, error) {
 	case 0x03:
 		dLen := int(buf[4])
 		if 5+dLen+2 > n {
-			return "", fmt.Errorf("domain name truncated")
+			return 0, "", fmt.Errorf("domain name truncated")
 		}
 		target = fmt.Sprintf("%s:%d", buf[5:5+dLen], binary.BigEndian.Uint16(buf[5+dLen:7+dLen]))
 	case 0x04:
 		target = fmt.Sprintf("[%s]:%d", net.IP(buf[4:20]), binary.BigEndian.Uint16(buf[20:22]))
 	default:
-		return "", fmt.Errorf("unsupported atyp %d", buf[3])
+		return 0, "", fmt.Errorf("unsupported atyp %d", buf[3])
 	}
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	return target, nil
+
+	switch cmd {
+	case 0x01: // CONNECT — success reply with dummy bind (0.0.0.0:0).
+		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return cmd, target, nil
+	case 0x03: // UDP ASSOCIATE — caller sends reply after binding relay.
+		return cmd, target, nil
+	default: // BIND (0x02) or anything else — reject cleanly.
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return 0, "", fmt.Errorf("unsupported cmd 0x%02x", cmd)
+	}
 }
 
 // paddingToMorphConfig converts mux.PaddingConfig to morph.Config.

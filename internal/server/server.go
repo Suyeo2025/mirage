@@ -508,6 +508,13 @@ func (s *Server) handleProxy(st *mux.Stream) {
 	}
 	target := string(targetBuf)
 
+	// "udp:" marker = SOCKS5 UDP ASSOCIATE session; dispatch to the UDP
+	// relay which frames datagrams back and forth over the same stream.
+	if strings.HasPrefix(target, "udp:") {
+		s.handleUDPRelay(st)
+		return
+	}
+
 	var (
 		dest net.Conn
 		err  error
