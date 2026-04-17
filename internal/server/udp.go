@@ -37,9 +37,11 @@ func (s *Server) handleUDPRelay(st *mux.Stream) {
 	}
 	defer pc.Close()
 
-	if s.config.Verbose {
-		log.Printf("udp relay: start on %s", pc.LocalAddr())
-	}
+	// (Per-relay start log removed: each line said only the local bind port,
+	// no target / no source — pure noise. With sing-box opening one
+	// ASSOCIATE per UDP flow this was generating ~500 lines/hour for zero
+	// debug value. Per-packet target info would belong on the frame
+	// handler, not here.)
 
 	done := make(chan struct{})
 	var once sync.Once
