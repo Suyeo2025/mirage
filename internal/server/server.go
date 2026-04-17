@@ -77,6 +77,13 @@ type serverSession struct {
 
 	stopDecoys func() // cancel decoy generator on teardown
 
+	// teardownOnce guards the per-session cleanup. Both the sessionReaper
+	// (when idle > 1 h) and the RecvLoop goroutine (when upstreamPW closes)
+	// race to tear the session down — running cleanup twice would panic
+	// on `close of closed channel` from stopDecoys (mux.StartDecoyGenerator
+	// returns a non-idempotent close-the-done-channel closure).
+	teardownOnce sync.Once
+
 	// downCancelMu guards the currently-serving GET handler's cancel func.
 	// Only one downstream handler may own the ReplayPipe at a time: a new
 	// GET arriving for this session cancels the previous one so data is
@@ -133,6 +140,22 @@ func (ss *serverSession) cancelDownHandler() {
 	if c != nil {
 		c()
 	}
+}
+
+// teardown runs the full session-cleanup sequence exactly once, regardless of
+// who calls it (reaper, RecvLoop exit, etc.). All steps are individually
+// idempotent except stopDecoys (which is `close(done)` from
+// mux.StartDecoyGenerator), so the sync.Once is what keeps us alive.
+func (ss *serverSession) teardown() {
+	ss.teardownOnce.Do(func() {
+		ss.cancelDownHandler()
+		ss.sess.Close()
+		ss.downstream.Close()
+		ss.upstreamPW.Close()
+		if ss.stopDecoys != nil {
+			ss.stopDecoys()
+		}
+	})
 }
 
 type Server struct {
@@ -348,12 +371,7 @@ func (s *Server) getOrCreateSession(sessionID []byte) *serverSession {
 		if err := sess.RecvLoop(upR); err != nil && err != io.EOF {
 			log.Printf("mux recv: %v", err)
 		}
-		sess.Close()
-		ss.cancelDownHandler()
-		ss.downstream.Close()
-		if ss.stopDecoys != nil {
-			ss.stopDecoys()
-		}
+		ss.teardown()
 		s.mu.Lock()
 		delete(s.sessions, key)
 		s.mu.Unlock()
@@ -580,13 +598,7 @@ func (s *Server) sessionReaper(ctx context.Context) {
 				// eventually reconnected its upAckedOff would no longer
 				// match the server's reset upRecv → 410 storm.
 				if now-ss.lastActive.Load() > 3600 {
-					ss.cancelDownHandler() // kick any in-flight GET handler
-					ss.sess.Close()
-					ss.downstream.Close()
-					ss.upstreamPW.Close() // unblocks RecvLoop goroutine
-					if ss.stopDecoys != nil {
-						ss.stopDecoys()
-					}
+					ss.teardown() // sync.Once-guarded full cleanup
 					delete(s.sessions, key)
 					log.Printf("reaped idle session")
 				}
