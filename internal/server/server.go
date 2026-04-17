@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,13 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	reality "github.com/xtls/reality"
+)
+
+// Wire headers for byte-level ACK. Must match the client's carrier package.
+// Server and client ship together from the same build, so no version gate.
+const (
+	headerMirageOffset = "X-Mirage-Offset"
+	headerMirageRx     = "X-Mirage-Rx"
 )
 
 type Config struct {
@@ -55,14 +63,76 @@ type Config struct {
 
 type serverSession struct {
 	sess       *mux.Session
-	downstream *mux.BufPipe  // mux writes downstream frames here → GET reads
-	upstreamW  io.Writer     // POST body data written here → mux RecvLoop reads
-	upstreamPW *io.PipeWriter // kept for Close() to unblock RecvLoop goroutine
-	lastActive atomic.Int64  // unix timestamp of last activity
+	downstream *mux.ReplayPipe // mux writes downstream frames here → GET reads at offset
+	upstreamW  io.Writer       // POST body data written here → mux RecvLoop reads
+	upstreamPW *io.PipeWriter  // kept for Close() to unblock RecvLoop goroutine
+	lastActive atomic.Int64    // unix timestamp of last activity
+
+	// Byte-level ACK state (protocol v2):
+	//   upRecv — total POST bytes this session has accepted and forwarded to
+	//            upstreamW. Clients include their X-Mirage-Offset on each
+	//            POST; server dedupes any overlap using upRecv and responds
+	//            with X-Mirage-Rx: upRecv.
+	upRecv atomic.Uint64
+
+	stopDecoys func() // cancel decoy generator on teardown
+
+	// downCancelMu guards the currently-serving GET handler's cancel func.
+	// Only one downstream handler may own the ReplayPipe at a time: a new
+	// GET arriving for this session cancels the previous one so data is
+	// never split between two response bodies (which would desync the
+	// client's mux RecvLoop).
+	//
+	// Identity is tracked via a monotonic generation counter rather than
+	// CancelFunc pointer comparison (which is not reliable — all closures
+	// from context.WithCancel share the same code pointer).
+	downCancelMu sync.Mutex
+	downCancel   context.CancelFunc
+	downGen      uint64
 }
 
 func (ss *serverSession) touch() {
 	ss.lastActive.Store(time.Now().Unix())
+}
+
+// installDownHandler registers cancel as the current downstream handler's
+// cancel func, invokes the previous one (if any) to kick the old handler
+// out of its WaitAndDrainCtx loop, and returns a generation token the
+// caller must pass to releaseDownHandler.
+func (ss *serverSession) installDownHandler(cancel context.CancelFunc) uint64 {
+	ss.downCancelMu.Lock()
+	old := ss.downCancel
+	ss.downGen++
+	gen := ss.downGen
+	ss.downCancel = cancel
+	ss.downCancelMu.Unlock()
+	if old != nil {
+		old()
+	}
+	return gen
+}
+
+// releaseDownHandler clears the registered cancel iff the caller's generation
+// still matches. A superseded handler's gen is stale and leaves the slot
+// untouched so the successor's cancel remains reachable.
+func (ss *serverSession) releaseDownHandler(gen uint64) {
+	ss.downCancelMu.Lock()
+	defer ss.downCancelMu.Unlock()
+	if ss.downGen == gen {
+		ss.downCancel = nil
+	}
+}
+
+// cancelDownHandler cancels and clears the current downstream handler, if any.
+// Called during session teardown.
+func (ss *serverSession) cancelDownHandler() {
+	ss.downCancelMu.Lock()
+	c := ss.downCancel
+	ss.downCancel = nil
+	ss.downCancelMu.Unlock()
+	if c != nil {
+		c()
+	}
 }
 
 type Server struct {
@@ -236,23 +306,33 @@ func (s *Server) getOrCreateSession(sessionID []byte) *serverSession {
 		return ss
 	}
 
-	// downstream: mux writes frames here → GET handler reads and streams to client
-	downstream := mux.NewBufPipe()
+	// downstream: mux writes frames here → GET handler ReadFromBlock at client's
+	// reported offset. ReplayPipe keeps unacked bytes around so a new GET can
+	// resume the byte stream exactly at the client's last-received offset
+	// after a carrier reset (no loss, no duplication — the fix for the
+	// earlier "bad record mac" class of failures).
+	downstream := mux.NewReplayPipe()
 
 	// upstream: POST handler writes data here → mux RecvLoop reads
 	upR, upW := io.Pipe()
 
-	sess := mux.NewSession(downstream) // mux writes downstream frames to BufPipe
+	sess := mux.NewSession(downstream) // mux writes downstream frames to ReplayPipe
 	sess.PaddingOracle = s.morpher     // wire morph engine into mux
 	sess.OnStream = func(st *mux.Stream) {
 		s.handleProxy(st)
 	}
+
+	// Server-side decoy stream generator so the asymmetry of "only client
+	// emits decoys" is not itself a fingerprint. Interval randomized around
+	// the client's own cadence for the same reason.
+	stopDecoys := sess.StartDecoyGenerator(2500 * time.Millisecond)
 
 	ss = &serverSession{
 		sess:       sess,
 		downstream: downstream,
 		upstreamW:  upW,
 		upstreamPW: upW,
+		stopDecoys: stopDecoys,
 	}
 	ss.touch()
 	s.sessions[key] = ss
@@ -269,6 +349,11 @@ func (s *Server) getOrCreateSession(sessionID []byte) *serverSession {
 			log.Printf("mux recv: %v", err)
 		}
 		sess.Close()
+		ss.cancelDownHandler()
+		ss.downstream.Close()
+		if ss.stopDecoys != nil {
+			ss.stopDecoys()
+		}
 		s.mu.Lock()
 		delete(s.sessions, key)
 		s.mu.Unlock()
@@ -293,19 +378,75 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	ss := s.getOrCreateSession(sessionID)
 	ss.touch()
 
-	if r.Method == http.MethodPost {
-		// Upstream: POST body contains mux frames
-		io.Copy(ss.upstreamW, r.Body)
-		w.WriteHeader(http.StatusOK)
-		return
+	// Both directions carry X-Mirage-Rx: the client's report of how many
+	// downstream bytes it has received. Use it to trim our downstream
+	// replay buffer — bounded memory + no risk of re-sending acked bytes.
+	if rxHdr := r.Header.Get(headerMirageRx); rxHdr != "" {
+		if rx, err := strconv.ParseUint(rxHdr, 10, 64); err == nil {
+			ss.downstream.Ack(rx)
+		}
 	}
 
-	// Downstream: GET → stream mux frames as chunked video/mp4
+	if r.Method == http.MethodPost {
+		s.handleUpstream(w, r, ss)
+		return
+	}
+	s.handleDownstream(w, r, ss)
+}
+
+// handleUpstream accepts POST'd upstream mux bytes at an absolute offset
+// declared in X-Mirage-Offset, dedupes any overlap the server has already
+// received (in case the client is retrying after a failed POST), forwards
+// the net-new bytes to the mux RecvLoop, and reports the new total back to
+// the client via X-Mirage-Rx.
+func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request, ss *serverSession) {
+	postOff, err := parseUintHeader(r.Header.Get(headerMirageOffset))
+	if err != nil {
+		s.apiError(w, 400)
+		return
+	}
+	expected := ss.upRecv.Load()
+	body := r.Body
+
+	// Client offset ahead of ours ⇒ gap: we're missing bytes that would have
+	// landed between expected and postOff. Can't recover without those bytes
+	// so tear the session down and let the client start fresh.
+	if postOff > expected {
+		log.Printf("upstream gap: client_off=%d server_expect=%d — tearing session", postOff, expected)
+		s.apiError(w, 410) // Gone — session state is unrecoverable
+		return
+	}
+	// Client offset behind ours ⇒ overlap: client is retransmitting bytes
+	// we've already forwarded. Skip the overlap.
+	if postOff < expected {
+		skip := int64(expected - postOff)
+		if _, err := io.CopyN(io.Discard, body, skip); err != nil {
+			// Short body: client didn't actually retransmit the overlap.
+			// No net-new bytes; respond with current ack.
+			w.Header().Set(headerMirageRx, strconv.FormatUint(expected, 10))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}
+
+	n, _ := io.Copy(ss.upstreamW, body)
+	newRecv := ss.upRecv.Add(uint64(n))
+	w.Header().Set(headerMirageRx, strconv.FormatUint(newRecv, 10))
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleDownstream streams downstream mux bytes starting at the client's
+// X-Mirage-Rx offset. If the client reports having received past our replay
+// base, we just continue from there (possibly replaying unacked bytes).
+func (s *Server) handleDownstream(w http.ResponseWriter, r *http.Request, ss *serverSession) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "no flusher", 500)
 		return
 	}
+
+	// Client's starting offset. Falls back to 0 if absent (first GET).
+	offset, _ := parseUintHeader(r.Header.Get(headerMirageRx))
 
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "no-cache, no-store")
@@ -313,31 +454,41 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	// Keepalive with configurable interval and CmdWaste padding
-	cfg := s.paddingCfg.Load()
-	kaMinSec := float64(cfg.KeepaliveMinSec)
-	kaMaxSec := float64(cfg.KeepaliveMaxSec)
-	if kaMinSec <= 0 {
-		kaMinSec = 3.0
-	}
-	if kaMaxSec <= kaMinSec {
-		kaMaxSec = kaMinSec + 5.0
-	}
+	// A session is allowed exactly one active downstream handler. If a new
+	// GET arrives while we are still serving, installDownHandler cancels us
+	// via ctx so the new handler can own the replay pipe alone.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	gen := ss.installDownHandler(cancel)
+	defer ss.releaseDownHandler(gen)
 
 	for {
-		data, err := ss.downstream.WaitAndDrain()
+		data, err := ss.downstream.ReadFromBlock(ctx, offset)
 		if len(data) > 0 {
-			w.Write(data)
+			if _, werr := w.Write(data); werr != nil {
+				// Client went away mid-response. Bytes stay in the replay
+				// pipe (ReadFromBlock is non-destructive); the next GET
+				// will re-request this offset and we'll resend them.
+				return
+			}
 			flusher.Flush()
+			offset += uint64(len(data))
 			ss.touch()
 		}
 		if err != nil {
-			return
-		}
-		if r.Context().Err() != nil {
+			// ctx.Err() means we were superseded or the session tore down.
+			// Unacked bytes stay in replay; successor picks up at its own
+			// offset. EOF means the pipe was closed (session reaped).
 			return
 		}
 	}
+}
+
+func parseUintHeader(h string) (uint64, error) {
+	if h == "" {
+		return 0, nil
+	}
+	return strconv.ParseUint(h, 10, 64)
 }
 
 func (s *Server) handleProxy(st *mux.Stream) {
@@ -411,9 +562,13 @@ func (s *Server) sessionReaper(ctx context.Context) {
 			now := time.Now().Unix()
 			for key, ss := range s.sessions {
 				if now-ss.lastActive.Load() > 300 { // 5 minutes
+					ss.cancelDownHandler() // kick any in-flight GET handler
 					ss.sess.Close()
 					ss.downstream.Close()
 					ss.upstreamPW.Close() // unblocks RecvLoop goroutine
+					if ss.stopDecoys != nil {
+						ss.stopDecoys()
+					}
 					delete(s.sessions, key)
 					log.Printf("reaped idle session")
 				}

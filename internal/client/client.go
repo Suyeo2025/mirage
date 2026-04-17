@@ -50,16 +50,19 @@ func New(cfg Config) *Client {
 }
 
 func (c *Client) Run(ctx context.Context) error {
-	// upstream: mux writes frames → BufPipe (never blocks) → carrier reads → POST
-	upstream := mux.NewBufPipe()
+	// upstream: mux writes frames → ReplayPipe → carrier Snapshot+POST.
+	// ReplayPipe is offset-aware: POST body is read non-destructively from
+	// the last-acknowledged byte, letting a failed or reset POST be retried
+	// without losing or duplicating bytes.
+	upstream := mux.NewReplayPipe()
 
-	// downstream: carrier writes from GET response → BufPipe → mux reads frames
+	// downstream: carrier writes from GET response → BufPipe → mux reads frames.
 	// BufPipe (non-blocking writes) decouples the carrier from the mux RecvLoop.
-	// With io.Pipe, a slow RecvLoop would block the carrier's Write, killing
-	// the entire downstream. BufPipe absorbs bursts and never blocks the writer.
+	// Replay on the downstream side is done server-side; the client only tracks
+	// a received-byte counter that it reports back via request headers.
 	downstream := mux.NewBufPipe()
 
-	// mux session writes upstream frames to BufPipe
+	// mux session writes upstream frames to the replay pipe.
 	sess := mux.NewSession(upstream)
 	sess.PaddingOracle = c.morpher // wire morph engine into mux
 
