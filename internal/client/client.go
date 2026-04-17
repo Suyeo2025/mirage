@@ -125,6 +125,14 @@ func (c *Client) Run(ctx context.Context) error {
 			log.Printf("accept: %v", err)
 			continue
 		}
+		// TCP keepalive: detect dead apps within ~75s instead of waiting for
+		// the OS default (~2 hours). Without this, a crashed/disappeared
+		// SOCKS5 client leaves us holding a mux.Stream + 3 goroutines per
+		// connection forever.
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			tcp.SetKeepAlive(true)
+			tcp.SetKeepAlivePeriod(30 * time.Second)
+		}
 		go c.handleConn(sess, conn)
 	}
 }

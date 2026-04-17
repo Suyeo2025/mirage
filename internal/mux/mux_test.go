@@ -158,7 +158,8 @@ func TestPaddingOracleInjection(t *testing.T) {
 		sendWndCh: make(chan struct{}, 1),
 		created:   time.Now(),
 	}
-	st.sendWnd.Store(maxWindow)
+	// Pre-grant credit so the test doesn't block waiting for a real peer.
+	st.sendWnd.Store(int64(initialWindow))
 
 	// Write data — should trigger padding oracle
 	st.Write([]byte("test"))

@@ -522,7 +522,12 @@ func (s *Server) handleProxy(st *mux.Stream) {
 	if s.config.Outbound != nil {
 		dest, err = s.config.Outbound.DialTarget(target)
 	} else {
-		dest, err = net.DialTimeout("tcp", target, 5*time.Second)
+		// Built-in dialer with TCP keepalive: detects dead targets within
+		// ~75s instead of the OS default ~2 hours, so a server that
+		// silently drops the connection (NAT timeout, mid-box reboot,
+		// etc.) doesn't leave us with a zombie mux stream and goroutines.
+		dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+		dest, err = dialer.Dial("tcp", target)
 	}
 	if err != nil {
 		if s.config.Verbose {

@@ -7,11 +7,12 @@ import (
 	"sync"
 )
 
-// maxReplayBytes caps the unacked buffer per direction. When full, Write
-// blocks until the peer acks some bytes (or the pipe closes). 4 MiB is a
-// generous window — even at 100 Mbps that's >300 ms of RTT slack, which is
-// more than any keepalive / ack interval.
-const maxReplayBytes = 4 * 1024 * 1024
+// maxReplayBytes caps unacked carrier bytes per direction. Sized to comfortably
+// hold several streams at their initial window: with initialWindow=2 MiB and
+// a typical concurrency of <8 active streams, 16 MiB lets each stream burst
+// without any one of them stalling at the carrier (per-stream backpressure
+// happens at the mux flow-control layer instead).
+const maxReplayBytes = 16 * 1024 * 1024
 
 var (
 	errReplayBehindBase   = errors.New("replay: offset behind base (already acked)")
