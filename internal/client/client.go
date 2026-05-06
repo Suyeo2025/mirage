@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"time"
@@ -178,34 +179,73 @@ func (c *Client) handleConn(sess *mux.Session, conn net.Conn) {
 // CONNECT) the target. The request reply itself is NOT written — the caller
 // is responsible for sending the appropriate reply once it knows what bind
 // endpoint to advertise (different between CONNECT and UDP ASSOCIATE).
+//
+// All field-sized reads go through io.ReadFull so a short / truncated frame
+// fails loudly instead of silently zero-filling the back of the buffer
+// (the previous handler would happily produce a "0.0.0.0:0" target out of
+// a 7-byte IPv4 request). A 5-second handshake deadline keeps a stalled
+// client from holding the accept goroutine and its mux stream forever.
 func handleSocks5(conn net.Conn) (byte, string, error) {
-	buf := make([]byte, 258)
-	n, err := conn.Read(buf)
-	if err != nil || n < 2 || buf[0] != 0x05 {
-		return 0, "", fmt.Errorf("bad greeting")
-	}
-	conn.Write([]byte{0x05, 0x00})
-	n, err = conn.Read(buf)
-	if err != nil || n < 7 {
-		return 0, "", fmt.Errorf("short request")
-	}
-	cmd := buf[1]
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
 
-	// Parse DST.ADDR / DST.PORT (used by CONNECT; ignored / zero for UDP).
-	var target string
-	switch buf[3] {
-	case 0x01:
-		target = fmt.Sprintf("%s:%d", net.IP(buf[4:8]), binary.BigEndian.Uint16(buf[8:10]))
-	case 0x03:
-		dLen := int(buf[4])
-		if 5+dLen+2 > n {
-			return 0, "", fmt.Errorf("domain name truncated")
+	// Greeting: [VER:1][NMETHODS:1][METHODS:NMETHODS]
+	var greet [2]byte
+	if _, err := io.ReadFull(conn, greet[:]); err != nil {
+		return 0, "", fmt.Errorf("greeting: %w", err)
+	}
+	if greet[0] != 0x05 {
+		return 0, "", fmt.Errorf("bad SOCKS version %d", greet[0])
+	}
+	if nMethods := int(greet[1]); nMethods > 0 {
+		if _, err := io.ReadFull(conn, make([]byte, nMethods)); err != nil {
+			return 0, "", fmt.Errorf("methods: %w", err)
 		}
-		target = fmt.Sprintf("%s:%d", buf[5:5+dLen], binary.BigEndian.Uint16(buf[5+dLen:7+dLen]))
-	case 0x04:
-		target = fmt.Sprintf("[%s]:%d", net.IP(buf[4:20]), binary.BigEndian.Uint16(buf[20:22]))
+	}
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		return 0, "", err
+	}
+
+	// Request: [VER:1][CMD:1][RSV:1][ATYP:1] then ATYP-specific addr+port
+	var hdr [4]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return 0, "", fmt.Errorf("request header: %w", err)
+	}
+	if hdr[0] != 0x05 {
+		return 0, "", fmt.Errorf("request bad SOCKS version %d", hdr[0])
+	}
+	cmd := hdr[1]
+
+	var target string
+	switch hdr[3] {
+	case 0x01: // IPv4: 4 addr + 2 port
+		var b [6]byte
+		if _, err := io.ReadFull(conn, b[:]); err != nil {
+			return 0, "", fmt.Errorf("v4 addr: %w", err)
+		}
+		target = fmt.Sprintf("%s:%d", net.IP(b[:4]), binary.BigEndian.Uint16(b[4:6]))
+	case 0x04: // IPv6: 16 addr + 2 port
+		var b [18]byte
+		if _, err := io.ReadFull(conn, b[:]); err != nil {
+			return 0, "", fmt.Errorf("v6 addr: %w", err)
+		}
+		target = fmt.Sprintf("[%s]:%d", net.IP(b[:16]), binary.BigEndian.Uint16(b[16:18]))
+	case 0x03: // domain: 1 length + N + 2 port
+		var lb [1]byte
+		if _, err := io.ReadFull(conn, lb[:]); err != nil {
+			return 0, "", fmt.Errorf("domain length: %w", err)
+		}
+		dLen := int(lb[0])
+		if dLen == 0 {
+			return 0, "", fmt.Errorf("zero-length domain")
+		}
+		b := make([]byte, dLen+2)
+		if _, err := io.ReadFull(conn, b); err != nil {
+			return 0, "", fmt.Errorf("domain: %w", err)
+		}
+		target = fmt.Sprintf("%s:%d", b[:dLen], binary.BigEndian.Uint16(b[dLen:dLen+2]))
 	default:
-		return 0, "", fmt.Errorf("unsupported atyp %d", buf[3])
+		return 0, "", fmt.Errorf("unsupported atyp %d", hdr[3])
 	}
 
 	switch cmd {
