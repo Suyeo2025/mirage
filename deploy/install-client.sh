@@ -1,11 +1,22 @@
 #!/bin/bash
 set -e
 
-PSK="${1:?Usage: install-client.sh <PSK>}"
+PSK="${1:?Usage: install-client.sh <PSK> [SERVER] [LISTEN]}"
 SERVER="${2:-sla.sunlawai.com}"
-LISTEN="${3:-0.0.0.0:1080}"
+# Loopback by default. SOCKS5 has no auth, so binding to 0.0.0.0 turns this
+# into an open proxy for anyone on the same network. Pass the third argument
+# explicitly (e.g. 0.0.0.0:1080) when running on a LAN gateway, and firewall
+# the port.
+LISTEN="${3:-127.0.0.1:1080}"
 
 echo "=== Mirage Client Install ==="
+case "$LISTEN" in
+	0.0.0.0:*|:*|\*:*)
+		echo "WARNING: SOCKS5 listen=$LISTEN is non-loopback. SOCKS5 has no"
+		echo "         authentication — anyone reaching this port can proxy"
+		echo "         through your tunnel. Make sure the port is firewalled."
+		;;
+esac
 
 mkdir -p /opt/mirage
 
