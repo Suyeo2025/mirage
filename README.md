@@ -15,54 +15,86 @@ Anti-censorship proxy with provable traffic obfuscation, REALITY TLS, and CDN co
 
 ## Quick Start
 
+> **Secrets handling**: never put `--psk` (or REALITY private key, outbound
+> UUID) on the command line. They leak through `ps`, `/proc/<pid>/cmdline`,
+> and `systemctl cat`. Put them in `/etc/mirage/env` (mode `0600`) and let
+> the binary read them via the `MIRAGE_PSK` / `MIRAGE_REALITY_PRIVATE_KEY` /
+> `MIRAGE_OUTBOUND_UUID` env vars. The systemd templates in `deploy/` already
+> wire this up via `EnvironmentFile`.
+
+### `/etc/mirage/env` (server)
+
+```
+MIRAGE_PSK=<pre-shared-key>
+MIRAGE_REALITY_PRIVATE_KEY=<base64-x25519-private-key>
+MIRAGE_OUTBOUND_UUID=<vmess-uuid>           # only if using outbound
+```
+
+### `/etc/mirage/env` (client)
+
+```
+MIRAGE_PSK=<pre-shared-key>
+```
+
 ### Server
 
 ```bash
-# REALITY mode (recommended)
+# REALITY mode (recommended) — secrets read from /etc/mirage/env
 mirage-server \
   --domain example.com \
-  --psk <pre-shared-key> \
   --reality-dest troncent.com:443 \
   --reality-sni troncent.com \
-  --reality-private-key <base64-x25519-private-key> \
   --reality-short-id <hex-short-id> \
   --listen :9445
 
 # With VMess+WS outbound (non-landing, traffic exits via upstream proxy)
 mirage-server \
   --domain example.com \
-  --psk <pre-shared-key> \
   --reality-dest troncent.com:443 \
   --reality-sni troncent.com \
-  --reality-private-key <base64-x25519-private-key> \
   --reality-short-id <hex-short-id> \
   --listen :9445 \
   --outbound-server <vmess-host>:<port> \
-  --outbound-uuid <vmess-uuid> \
   --outbound-ws-path /relay
 
 # Let's Encrypt mode
-mirage-server --domain example.com --psk <key> --listen :443
+mirage-server --domain example.com --listen :443
 
 # Custom certificate
-mirage-server --domain example.com --psk <key> --cert cert.pem --key key.pem --listen :8444
+mirage-server --domain example.com --cert cert.pem --key key.pem --listen :8444
+```
+
+### Server policy
+
+By default the server refuses to dial private/bogon IP space (RFC1918, CGNAT,
+loopback, link-local, multicast, IPv6 ULA, etc.) — this stops a leaked PSK
+from turning the server into an internal-network SSRF jump. Targets are
+resolved once and dialed by IP to close the DNS-rebind window.
+
+To allow a specific internal range (e.g. reach a NAS at `192.168.1.10`):
+
+```bash
+mirage-server --allow-cidr 192.168.0.0/16,10.0.0.0/8 ...
 ```
 
 ### Client
 
 ```bash
-# REALITY mode
+# REALITY mode — PSK from /etc/mirage/env
 mirage-client \
   --server <ip>:9445 \
-  --psk <pre-shared-key> \
   --reality-public-key <base64-x25519-public-key> \
   --reality-short-id <hex-short-id> \
   --reality-sni troncent.com \
-  --listen 0.0.0.0:1090
+  --listen 127.0.0.1:1080
 
 # Direct TLS mode
-mirage-client --server example.com:8444 --psk <key> --listen 127.0.0.1:1080
+mirage-client --server example.com:8444 --listen 127.0.0.1:1080
 ```
+
+> **Listen address**: SOCKS5 has no auth. The default `127.0.0.1:1080` keeps
+> the proxy local. Only bind to `0.0.0.0` if you are deliberately exposing it
+> to a trusted LAN (e.g. on a router), and firewall the port.
 
 ### sing-box Integration
 
@@ -75,7 +107,7 @@ Add as SOCKS5 outbound in sing-box:
       "type": "socks",
       "tag": "mirage",
       "server": "127.0.0.1",
-      "server_port": 1090
+      "server_port": 1080
     }
   ]
 }
