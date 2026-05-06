@@ -96,6 +96,15 @@ type serverSession struct {
 	downCancelMu sync.Mutex
 	downCancel   context.CancelFunc
 	downGen      uint64
+
+	// upMu serializes concurrent POSTs against the same session. An honest
+	// client's upstreamLoop is single-goroutine, so it never collides with
+	// itself; the lock is a hardening measure against an adversary who has
+	// the PSK and could otherwise fire parallel POSTs to interleave their
+	// bytes through the io.Pipe (whose Write mutex serializes per-Write
+	// only, not per-POST). Interleaved bytes corrupt mux frames and DoS
+	// the victim's session.
+	upMu sync.Mutex
 }
 
 func (ss *serverSession) touch() {
@@ -199,7 +208,16 @@ func (s *Server) Run(ctx context.Context) error {
 	m.HandleFunc("/api/v1/courses/stream", s.handleTunnel)
 	m.HandleFunc("/", s.serveWebsite)
 
-	srv := &http.Server{Addr: s.config.Listen, Handler: m}
+	srv := &http.Server{
+		Addr:    s.config.Listen,
+		Handler: m,
+		// ReadHeaderTimeout is the only general timeout we set: it stops
+		// slowloris-on-headers without breaking the long-lived streaming
+		// GET (downstream tunnel) or large/slow POST bodies (upstream
+		// tunnel batches). ReadTimeout / IdleTimeout would cut legitimate
+		// tunnel traffic so we leave them at the default (no limit).
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 
 	if s.config.NoTLS {
 		// Plain HTTP/2 mode — for use behind REALITY, nginx, or other TLS terminator.
@@ -225,7 +243,12 @@ func (s *Server) Run(ctx context.Context) error {
 			HostPolicy: autocert.HostWhitelist(s.config.Domain),
 			Cache:      autocert.DirCache(s.config.CertDir),
 		}
-		go http.ListenAndServe(":80", certManager.HTTPHandler(nil))
+		acmeSrv := &http.Server{
+			Addr:              ":80",
+			Handler:           certManager.HTTPHandler(nil),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go acmeSrv.ListenAndServe()
 		srv.TLSConfig = certManager.TLSConfig()
 		srv.TLSConfig.MinVersion = tls.VersionTLS12
 		srv.TLSConfig.NextProtos = []string{"h2", "http/1.1"}
@@ -423,6 +446,13 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request, ss *serv
 		s.apiError(w, 400)
 		return
 	}
+
+	// Serialize concurrent POSTs against the same session — see upMu doc on
+	// serverSession. Held across the full skip+copy+ack sequence so the
+	// expected/upRecv pair stays consistent.
+	ss.upMu.Lock()
+	defer ss.upMu.Unlock()
+
 	expected := ss.upRecv.Load()
 	body := r.Body
 
