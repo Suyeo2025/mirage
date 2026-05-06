@@ -418,8 +418,18 @@ func (st *Stream) Write(p []byte) (int, error) {
 		// blocks here — that is correct backpressure (only this stream
 		// stalls, other streams in the same session stay flowing because
 		// each has its own sendWnd).
+		//
+		// st.done unblocks the wait too: a remote CmdFIN arriving while
+		// we are short on credit takes the pushEOF→markDone path, which
+		// does NOT touch sendWndCh. Without this select arm, the writer
+		// would hang forever (the leak path that local Close already
+		// handles by draining sendWndCh).
 		for st.sendWnd.Load() < int64(len(chunk)) {
-			<-st.sendWndCh
+			select {
+			case <-st.sendWndCh:
+			case <-st.done:
+				return total, io.ErrClosedPipe
+			}
 			if st.closed.Load() {
 				return total, io.ErrClosedPipe
 			}

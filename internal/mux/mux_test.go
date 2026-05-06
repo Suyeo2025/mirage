@@ -205,6 +205,49 @@ func TestBufPipeReady(t *testing.T) {
 	}
 }
 
+// TestWriteUnblocksOnRemoteFIN verifies that a Write blocked waiting on send
+// credit returns ErrClosedPipe when the remote peer sends CmdFIN. Before the
+// fix in mux.go, pushEOF only closed st.done without signalling sendWndCh, so
+// the writer would hang forever — the goroutine-leak path on the server side
+// when a target endpoint closed first while the proxy stream was mid-write.
+func TestWriteUnblocksOnRemoteFIN(t *testing.T) {
+	var buf bytes.Buffer
+	sess := NewSession(&buf)
+	st := &Stream{
+		id:        1,
+		sess:      sess,
+		readBuf:   make(chan []byte, 256),
+		done:      make(chan struct{}),
+		sendWndCh: make(chan struct{}, 1),
+		created:   time.Now(),
+	}
+	// sendWnd left at zero — Write will block waiting for credit that will
+	// never come, just like a real stream after the peer has stopped reading.
+
+	// Simulate remote FIN arriving 50 ms into the blocked Write. This is the
+	// exact path RecvLoop takes for CmdFIN: pushEOF → markDone, no sendWndCh
+	// touch and no st.closed flip.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		st.pushEOF()
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := st.Write([]byte("blocked"))
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != io.ErrClosedPipe {
+			t.Fatalf("got err %v, want ErrClosedPipe", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write did not unblock after remote FIN — goroutine leak path")
+	}
+}
+
 func TestMultipleStreams(t *testing.T) {
 	client, server, cleanup := pipeSession(t)
 	defer cleanup()
