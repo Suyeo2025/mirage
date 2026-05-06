@@ -197,10 +197,30 @@ func handleSocks5(conn net.Conn) (byte, string, error) {
 	if greet[0] != 0x05 {
 		return 0, "", fmt.Errorf("bad SOCKS version %d", greet[0])
 	}
-	if nMethods := int(greet[1]); nMethods > 0 {
-		if _, err := io.ReadFull(conn, make([]byte, nMethods)); err != nil {
-			return 0, "", fmt.Errorf("methods: %w", err)
+	nMethods := int(greet[1])
+	if nMethods == 0 {
+		// RFC 1928: NMETHODS=0 is malformed. Reply NO_ACCEPTABLE_METHODS
+		// and bail rather than auto-replying NO_AUTH (which would let a
+		// confused or hostile client think it negotiated something).
+		conn.Write([]byte{0x05, 0xff})
+		return 0, "", fmt.Errorf("nmethods=0")
+	}
+	methods := make([]byte, nMethods)
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return 0, "", fmt.Errorf("methods: %w", err)
+	}
+	hasNoAuth := false
+	for _, m := range methods {
+		if m == 0x00 {
+			hasNoAuth = true
+			break
 		}
+	}
+	if !hasNoAuth {
+		// We only support NO_AUTH; tell the client none of its offered
+		// methods are acceptable per RFC 1928 §3.
+		conn.Write([]byte{0x05, 0xff})
+		return 0, "", fmt.Errorf("client did not offer NO_AUTH (methods=%v)", methods)
 	}
 	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
 		return 0, "", err

@@ -127,6 +127,34 @@ func TestSocks5RejectsTruncatedIPv6(t *testing.T) {
 	}
 }
 
+// TestSocks5RejectsZeroMethods covers a malformed greeting where NMETHODS=0.
+// Pre-fix the client auto-replied NO_AUTH, letting a misbehaving client
+// think it negotiated something. RFC 1928 says reply 0xff and abort.
+func TestSocks5RejectsZeroMethods(t *testing.T) {
+	req := []byte{0x05, 0x00} // VER=5, NMETHODS=0
+	_, _, err, written := runHandshake(t, req)
+	if err == nil {
+		t.Fatal("expected error on nmethods=0, got nil")
+	}
+	if len(written) < 2 || written[0] != 0x05 || written[1] != 0xff {
+		t.Errorf("expected reply {0x05,0xff}, got %x", written)
+	}
+}
+
+// TestSocks5RejectsMissingNoAuth covers a client that offers only auth
+// methods we don't support (e.g. USER/PASS = 0x02). We should reply 0xff
+// per RFC and abort instead of silently sending 0x00 NO_AUTH.
+func TestSocks5RejectsMissingNoAuth(t *testing.T) {
+	req := []byte{0x05, 0x01, 0x02} // VER=5, NMETHODS=1, methods=[USER/PASS]
+	_, _, err, written := runHandshake(t, req)
+	if err == nil {
+		t.Fatal("expected error when client offers no NO_AUTH, got nil")
+	}
+	if len(written) < 2 || written[0] != 0x05 || written[1] != 0xff {
+		t.Errorf("expected reply {0x05,0xff}, got %x", written)
+	}
+}
+
 func TestSocks5HandshakeDeadline(t *testing.T) {
 	// Stall: open the conn but never write anything. Without the deadline,
 	// handleSocks5 would block forever; with it, ReadFull should fail
