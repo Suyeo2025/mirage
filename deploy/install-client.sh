@@ -18,11 +18,21 @@ case "$LISTEN" in
 		;;
 esac
 
-mkdir -p /opt/mirage
+mkdir -p /opt/mirage /etc/mirage
 
 # Copy binary
 cp mirage-client /opt/mirage/mirage-client
 chmod +x /opt/mirage/mirage-client
+
+# Secret material lives in /etc/mirage/env (root-only). Keeping the PSK off
+# the ExecStart line stops `ps` and /proc/<pid>/cmdline from leaking it.
+umask 077
+cat > /etc/mirage/env << ENVEOF
+MIRAGE_PSK=${PSK}
+ENVEOF
+chmod 600 /etc/mirage/env
+chown root:root /etc/mirage/env
+umask 022
 
 # Systemd service
 cat > /etc/systemd/system/mirage-client.service << EOF
@@ -33,7 +43,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/mirage/mirage-client --server ${SERVER} --psk ${PSK} --listen ${LISTEN}
+EnvironmentFile=/etc/mirage/env
+ExecStart=/opt/mirage/mirage-client --server ${SERVER} --listen ${LISTEN}
 Restart=always
 RestartSec=3
 LimitNOFILE=65535

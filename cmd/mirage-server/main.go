@@ -35,8 +35,22 @@ func main() {
 	outboundWSPath := flag.String("outbound-ws-path", "", "outbound WebSocket path (e.g. /relay)")
 	flag.Parse()
 
+	// Secrets fall back to env vars when the corresponding flag is empty.
+	// Lets systemd ship them via a 0600 EnvironmentFile instead of putting
+	// them on ExecStart — where they would otherwise leak through ps,
+	// /proc/<pid>/cmdline, journalctl unit dumps, etc.
+	if *psk == "" {
+		*psk = os.Getenv("MIRAGE_PSK")
+	}
+	if *realityKey == "" {
+		*realityKey = os.Getenv("MIRAGE_REALITY_PRIVATE_KEY")
+	}
+	if *outboundUUID == "" {
+		*outboundUUID = os.Getenv("MIRAGE_OUTBOUND_UUID")
+	}
+
 	if *psk == "" || *domain == "" {
-		log.Fatal("--domain and --psk are required")
+		log.Fatal("--domain and --psk (or MIRAGE_PSK env) are required")
 	}
 
 	// Initialize outbound proxy if configured

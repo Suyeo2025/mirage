@@ -21,8 +21,14 @@ func main() {
 	realitySNI := flag.String("reality-sni", "", "REALITY server name (e.g. troncent.com)")
 	flag.Parse()
 
+	// PSK falls back to env so systemd can pass it through a 0600
+	// EnvironmentFile instead of leaking on the ExecStart line.
+	if *psk == "" {
+		*psk = os.Getenv("MIRAGE_PSK")
+	}
+
 	if *serverAddr == "" || *psk == "" {
-		log.Fatal("--server and --psk are required")
+		log.Fatal("--server and --psk (or MIRAGE_PSK env) are required")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
