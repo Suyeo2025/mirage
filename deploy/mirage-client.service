@@ -5,10 +5,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Secrets live in /etc/mirage/env (mode 0600 root-only). Create it with:
+#   MIRAGE_PSK=<your-psk>
+# Keeping the PSK off the ExecStart line stops `ps`, /proc/<pid>/cmdline
+# and `systemctl cat` from leaking it.
+EnvironmentFile=/etc/mirage/env
+# Loopback by default. SOCKS5 has no auth — switching to 0.0.0.0 turns
+# this into an open proxy for anyone who can reach the port. Only flip
+# to 0.0.0.0 on a LAN gateway, and firewall the port.
 ExecStart=/opt/mirage/mirage-client \
     --server sla.sunlawai.com \
-    --psk CHANGE_ME \
-    --listen 0.0.0.0:1080
+    --listen 127.0.0.1:1080
 Restart=always
 RestartSec=3
 LimitNOFILE=65535

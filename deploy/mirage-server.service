@@ -5,9 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Secrets live in /etc/mirage/env (mode 0600 root-only). At minimum set:
+#   MIRAGE_PSK=<your-psk>
+# Plus, when REALITY or an outbound relay is enabled:
+#   MIRAGE_REALITY_PRIVATE_KEY=<base64-32-byte-x25519>
+#   MIRAGE_OUTBOUND_UUID=<vmess-uuid>
+# Keeping these off the ExecStart line stops `ps`, /proc/<pid>/cmdline
+# and `systemctl cat` from leaking them.
+EnvironmentFile=/etc/mirage/env
 ExecStart=/opt/mirage/mirage-server \
     --domain sla.sunlawai.com \
-    --psk CHANGE_ME \
     --web-root /opt/mirage/web \
     --cert-dir /opt/mirage/certs \
     --listen :443
