@@ -193,13 +193,36 @@ func (c *ClientCarrier) resetTransport() {
 	}
 }
 
+// validateRealityClientConfig fails fast on misconfigured REALITY credentials
+// rather than letting the underlying decode fall through to a zero-padded /
+// truncated key that produces opaque "handshake failed" errors at every dial.
+func validateRealityClientConfig(pubKeyB64, shortIDHex string) ([]byte, []byte, error) {
+	pub, err := base64.RawURLEncoding.DecodeString(pubKeyB64)
+	if err != nil {
+		return nil, nil, fmt.Errorf("--reality-public-key: not valid base64: %w", err)
+	}
+	if len(pub) != 32 {
+		return nil, nil, fmt.Errorf("--reality-public-key: decoded length %d, want 32 (x25519)", len(pub))
+	}
+	sid, err := hex.DecodeString(shortIDHex)
+	if err != nil {
+		return nil, nil, fmt.Errorf("--reality-short-id: not valid hex: %w", err)
+	}
+	if len(sid) > 8 {
+		return nil, nil, fmt.Errorf("--reality-short-id: decoded length %d, max 8", len(sid))
+	}
+	return pub, sid, nil
+}
+
 // buildTLSDialer returns a TLS dial function.
 // If REALITY is configured, uses reality.Client() for perfect TLS mimicry.
 // Otherwise, uses uTLS with Chrome fingerprint.
 func buildTLSDialer(cfg ClientCarrierConfig) func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 	if cfg.RealityPublicKey != "" {
-		pubKey, _ := base64.RawURLEncoding.DecodeString(cfg.RealityPublicKey)
-		shortIDBytes, _ := hex.DecodeString(cfg.RealityShortID)
+		pubKey, shortIDBytes, err := validateRealityClientConfig(cfg.RealityPublicKey, cfg.RealityShortID)
+		if err != nil {
+			log.Fatalf("carrier: %v", err)
+		}
 		var shortID [8]byte
 		copy(shortID[:], shortIDBytes)
 		realDialAddr := cfg.ServerAddr // real IP:port

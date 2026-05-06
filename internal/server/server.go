@@ -294,12 +294,18 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) runWithReality(ctx context.Context, srv *http.Server, handler http.Handler) error {
 	privKeyBytes, err := base64.RawURLEncoding.DecodeString(s.config.RealityPrivateKey)
 	if err != nil {
-		return fmt.Errorf("reality: invalid private key: %w", err)
+		return fmt.Errorf("reality: --reality-private-key not valid base64: %w", err)
+	}
+	if len(privKeyBytes) != 32 {
+		return fmt.Errorf("reality: --reality-private-key decoded length %d, want 32 (x25519)", len(privKeyBytes))
 	}
 
 	shortIDBytes, err := hex.DecodeString(s.config.RealityShortID)
 	if err != nil {
-		return fmt.Errorf("reality: invalid short id: %w", err)
+		return fmt.Errorf("reality: --reality-short-id not valid hex: %w", err)
+	}
+	if len(shortIDBytes) > 8 {
+		return fmt.Errorf("reality: --reality-short-id decoded length %d, max 8", len(shortIDBytes))
 	}
 	var shortID [8]byte
 	copy(shortID[:], shortIDBytes)
