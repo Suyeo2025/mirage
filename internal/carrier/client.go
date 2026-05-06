@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -62,6 +63,17 @@ type ClientCarrier struct {
 	cancel      context.CancelFunc
 	buildDialTLS func() func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error)
 	mu           sync.Mutex
+
+	// sessionLost closes once when the server returns 410 Gone, indicating
+	// our mux byte-stream offset has drifted from server-side state in a way
+	// that we cannot recover via retransmit (server reaped the session, or
+	// the server process restarted). The supervisor in internal/client
+	// watches this channel and tears the carrier + mux down, rebuilds with
+	// a fresh sessionID, and resumes — same effect as the previous
+	// log.Fatalf-restart-by-systemd path, but works under any process
+	// supervisor (including none).
+	sessionLost     chan struct{}
+	sessionLostOnce sync.Once
 
 	// Epoch context: every in-flight POST/GET derives from epochCtx. On
 	// resetTransport we cancel the old epoch and create a new one, which
@@ -147,6 +159,7 @@ func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 		cancel:       cancel,
 		buildDialTLS: buildDialer,
 		startTime:    time.Now(),
+		sessionLost:  make(chan struct{}),
 	}
 	cc.epochCtx, cc.epochCancel = context.WithCancel(ctx)
 	return cc
@@ -301,6 +314,27 @@ func (c *ClientCarrier) Run() {
 	go func() { defer wg.Done(); c.upstreamLoop() }()
 	go func() { defer wg.Done(); c.downstreamLoop() }()
 	wg.Wait()
+}
+
+// SessionLost returns a channel that closes when the server has indicated
+// (via 410 Gone) that this session is unrecoverable. The supervisor should
+// tear the carrier and mux down and rebuild with a fresh sessionID. Closing
+// this channel also cancels the carrier's main context so the upstream and
+// downstream loops exit instead of hammering the server with more 410s.
+func (c *ClientCarrier) SessionLost() <-chan struct{} { return c.sessionLost }
+
+// signalSessionLost is the single entry-point for declaring a session dead.
+// Idempotent: subsequent calls are no-ops, so the upstream and downstream
+// loops can both safely race to it. Cancelling c.ctx is what makes
+// upstreamLoop / downstreamLoop drop out instead of stay in their retry
+// timers — without it, they would keep firing 410s while the supervisor is
+// trying to rebuild.
+func (c *ClientCarrier) signalSessionLost() {
+	c.sessionLostOnce.Do(func() {
+		log.Printf("carrier: session lost (server returned 410), signaling rebuild")
+		close(c.sessionLost)
+		c.cancel()
+	})
 }
 
 // CarrierStats is the snapshot returned by the client's admin /status. The
@@ -484,11 +518,13 @@ func (c *ClientCarrier) sendPost(data []byte, off uint64) error {
 		// state. The two ways this happens (server process restart, server
 		// reaped our session for idle) both leave the mux layer in an
 		// unrecoverable state: the old mux byte stream encoded streams /
-		// frames that the server no longer knows about, so we can't just
-		// reset upAckedOff and resume. Simplest correct recovery is to
-		// exit — systemd restarts us with a fresh sessionID + fresh mux.
-		// In-flight SOCKS5 connections die but reconnect transparently.
-		log.Fatalf("carrier: server rejected session with 410 — exiting for systemd restart")
+		// frames that the server no longer knows about, so we can't reset
+		// upAckedOff and resume on the same carrier. Signal the supervisor
+		// so it can rebuild with a fresh sessionID; the supervisor handles
+		// the mux teardown and SOCKS5 listener continuity. In-flight SOCKS5
+		// connections die but reconnect transparently.
+		c.signalSessionLost()
+		return errors.New("session lost (410)")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status %d", resp.StatusCode)

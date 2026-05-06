@@ -21,10 +21,11 @@ type ClientStats struct {
 	Carrier        carrier.CarrierStats `json:"carrier"`
 }
 
-// adminHandler builds the loopback admin handler for a running client.
-// Closure captures car and the run-scoped startTime / sessionID so the
-// caller (Run) can keep them as locals instead of mutating Client.
-func adminHandler(cfg Config, sessionID []byte, started time.Time, car *carrier.ClientCarrier) http.Handler {
+// adminHandler returns the loopback /status handler. It reads c.live on
+// every request rather than capturing a fixed pointer in the closure, so
+// stats reflect the currently-active session — including after a 410
+// rebuild swapped in a fresh session+carrier underneath.
+func (c *Client) adminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -32,17 +33,20 @@ func adminHandler(cfg Config, sessionID []byte, started time.Time, car *carrier.
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		short := ""
-		if len(sessionID) >= 4 {
-			short = hex.EncodeToString(sessionID[:4])
-		}
+		cur := c.live.Load()
 		stats := ClientStats{
-			UptimeSec:      int64(time.Since(started).Seconds()),
-			SessionIDShort: short,
-			Listen:         cfg.Listen,
-			ServerAddr:     cfg.ServerAddr,
-			RealityOn:      cfg.RealityPublicKey != "",
-			Carrier:        car.Stats(),
+			Listen:     c.config.Listen,
+			ServerAddr: c.config.ServerAddr,
+			RealityOn:  c.config.RealityPublicKey != "",
+		}
+		if cur != nil {
+			short := ""
+			if len(cur.sessionID) >= 4 {
+				short = hex.EncodeToString(cur.sessionID[:4])
+			}
+			stats.UptimeSec = int64(time.Since(cur.started).Seconds())
+			stats.SessionIDShort = short
+			stats.Carrier = cur.car.Stats()
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(stats)

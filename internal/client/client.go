@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/houden/mirage/internal/admin"
@@ -17,6 +18,13 @@ import (
 	"github.com/houden/mirage/internal/mux"
 	"github.com/houden/mirage/internal/relay"
 )
+
+// rebuildCooldown bounds how often the supervisor will reconstruct the
+// session+carrier pair after a 410. If the server is wedged and emits 410
+// every reconnect, the cooldown stops us from saturating its CPU and our
+// log volume; legitimate single-shot 410s pay only 2 s of latency before
+// SOCKS5 traffic is flowing again.
+const rebuildCooldown = 2 * time.Second
 
 type Config struct {
 	ServerAddr string
@@ -36,45 +44,55 @@ type Config struct {
 }
 
 type Client struct {
-	config    Config
-	auth      *auth.Auth
-	sessionID []byte
-	morpher   *morph.Morpher
+	config  Config
+	auth    *auth.Auth
+	morpher *morph.Morpher
+
+	// live holds the active mux.Session + ClientCarrier + sessionID. The
+	// supervisor goroutine atomically swaps in a freshly built liveSession
+	// whenever the carrier reports SessionLost (HTTP 410 from the server,
+	// meaning our byte-stream offset has drifted from server-side state).
+	// The accept loop and the admin /status handler each Load() to find
+	// the current session without locking.
+	live atomic.Pointer[liveSession]
+}
+
+// liveSession is the immutable tuple of state for one client incarnation.
+// On rebuild a brand-new liveSession is constructed and atomically swapped
+// in; the old one's goroutines drain to EOF as their pipes close.
+type liveSession struct {
+	sess       *mux.Session
+	car        *carrier.ClientCarrier
+	sessionID  []byte
+	started    time.Time
+	stopDecoys func()
 }
 
 func New(cfg Config) *Client {
-	sid := make([]byte, 16)
-	rand.Read(sid)
 	if cfg.UserID == 0 {
 		cfg.UserID = 1
 	}
 	return &Client{
-		config:    cfg,
-		auth:      auth.New(cfg.PSK),
-		sessionID: sid,
-		morpher:   morph.New(nil), // defaults; updated by server CmdSettings
+		config:  cfg,
+		auth:    auth.New(cfg.PSK),
+		morpher: morph.New(nil), // defaults; updated by server CmdSettings
 	}
 }
 
-func (c *Client) Run(ctx context.Context) error {
-	started := time.Now()
-	// upstream: mux writes frames → ReplayPipe → carrier Snapshot+POST.
-	// ReplayPipe is offset-aware: POST body is read non-destructively from
-	// the last-acknowledged byte, letting a failed or reset POST be retried
-	// without losing or duplicating bytes.
-	upstream := mux.NewReplayPipe()
+// build constructs a fresh session+carrier pair with a new random sessionID.
+// The mux RecvLoop and carrier loops are launched into their own goroutines.
+// The caller is expected to atomically install the result via c.live.Store.
+func (c *Client) build() *liveSession {
+	sid := make([]byte, 16)
+	rand.Read(sid)
 
-	// downstream: carrier writes from GET response → BufPipe → mux reads frames.
-	// BufPipe (non-blocking writes) decouples the carrier from the mux RecvLoop.
-	// Replay on the downstream side is done server-side; the client only tracks
-	// a received-byte counter that it reports back via request headers.
+	// upstream: mux frames → ReplayPipe → carrier Snapshot+POST.
+	// downstream: carrier writes from GET → BufPipe → mux reads.
+	upstream := mux.NewReplayPipe()
 	downstream := mux.NewBufPipe()
 
-	// mux session writes upstream frames to the replay pipe.
 	sess := mux.NewSession(upstream)
-	sess.PaddingOracle = c.morpher // wire morph engine into mux
-
-	// Handle server-pushed padding config
+	sess.PaddingOracle = c.morpher
 	sess.OnSettings = func(data []byte) {
 		cfg, err := mux.DecodePaddingConfig(data)
 		if err != nil {
@@ -83,17 +101,12 @@ func (c *Client) Run(ctx context.Context) error {
 		c.morpher.UpdateConfig(paddingToMorphConfig(cfg))
 		log.Printf("padding config updated from server")
 	}
-
-	// Start decoy stream generator to drown inner TLS handshake patterns
-	// (Xue et al. USENIX 2024: multiplexing reduces detection >70%)
 	stopDecoys := sess.StartDecoyGenerator(2 * time.Second)
-	defer stopDecoys()
 
-	// carrier bridges mux ↔ HTTPS (or REALITY TLS)
 	car := carrier.NewClientCarrier(carrier.ClientCarrierConfig{
 		ServerAddr:       c.config.ServerAddr,
 		Auth:             c.auth,
-		SessionID:        c.sessionID,
+		SessionID:        sid,
 		UserID:           c.config.UserID,
 		Upstream:         upstream,
 		DownstreamW:      downstream,
@@ -102,32 +115,54 @@ func (c *Client) Run(ctx context.Context) error {
 		RealitySNI:       c.config.RealitySNI,
 	})
 	go car.Run()
-
-	// mux reads downstream frames from BufPipe
 	go func() {
 		if err := sess.RecvLoop(downstream); err != nil {
 			log.Printf("mux recv: %v", err)
 		}
 	}()
 
-	log.Printf("SOCKS5 on %s → %s", c.config.Listen, c.config.ServerAddr)
-
-	if c.config.AdminListen != "" {
-		if err := admin.Listen(c.config.AdminListen, adminHandler(c.config, c.sessionID, started, car)); err != nil {
-			return err
-		}
+	return &liveSession{
+		sess:       sess,
+		car:        car,
+		sessionID:  sid,
+		started:    time.Now(),
+		stopDecoys: stopDecoys,
 	}
+}
 
+func (c *Client) Run(ctx context.Context) error {
+	c.live.Store(c.build())
+
+	// SOCKS5 listener is a single bind that survives session rebuilds.
+	// Tearing it down on 410 would interrupt every in-flight inbound
+	// connection and could race the OS port reuse window; instead we
+	// keep the listener and let new accepts attach to whatever live
+	// session is current at Accept time.
 	ln, err := net.Listen("tcp", c.config.Listen)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
+	}
+
+	log.Printf("SOCKS5 on %s → %s", c.config.Listen, c.config.ServerAddr)
+
+	// Supervisor: rebuild on SessionLost (410) until ctx is done.
+	go c.supervise(ctx)
+
+	if c.config.AdminListen != "" {
+		// Admin reads c.live.Load() per request, so it always reports the
+		// currently-active session+carrier — including across rebuilds.
+		if err := admin.Listen(c.config.AdminListen, c.adminHandler()); err != nil {
+			return err
+		}
 	}
 
 	// Graceful shutdown
 	go func() {
 		<-ctx.Done()
 		ln.Close()
-		car.Stop()
+		if cur := c.live.Load(); cur != nil {
+			cur.car.Stop()
+		}
 	}()
 
 	for {
@@ -147,7 +182,46 @@ func (c *Client) Run(ctx context.Context) error {
 			tcp.SetKeepAlive(true)
 			tcp.SetKeepAlivePeriod(30 * time.Second)
 		}
-		go c.handleConn(sess, conn)
+		cur := c.live.Load()
+		if cur == nil {
+			conn.Close()
+			continue
+		}
+		go c.handleConn(cur.sess, conn)
+	}
+}
+
+// supervise watches the current carrier's SessionLost channel and rebuilds
+// the live session+carrier pair when the server returns 410. The previous
+// implementation called log.Fatalf and relied on systemd to restart the
+// process; this works under any supervisor (systemd, launchd, docker, none)
+// and avoids the brief outage of a process restart.
+func (c *Client) supervise(ctx context.Context) {
+	for {
+		cur := c.live.Load()
+		if cur == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-cur.car.SessionLost():
+			log.Printf("client: rebuilding session after 410")
+			// Cooldown before rebuild — protects a wedged server from
+			// receiving a tight loop of new sessions, and gives in-flight
+			// SOCKS5 connections a moment to notice their streams ended.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(rebuildCooldown):
+			}
+			// Tear down the old incarnation. car already self-cancelled
+			// inside signalSessionLost; sess.Close releases mux streams so
+			// any blocked relay.Bidirectional copies wake up and exit.
+			cur.stopDecoys()
+			cur.sess.Close()
+			c.live.Store(c.build())
+		}
 	}
 }
 

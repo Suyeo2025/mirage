@@ -1,8 +1,10 @@
 package carrier
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateRealityClientConfig(t *testing.T) {
@@ -66,4 +68,34 @@ func TestValidateRealityClientConfig(t *testing.T) {
 			t.Errorf("sid len = %d, want 2", len(sid))
 		}
 	})
+}
+
+// TestSignalSessionLost verifies the 410 recovery signaling: closing
+// SessionLost is the wakeup the client supervisor watches for, and
+// cancelling the carrier context is what stops upstreamLoop /
+// downstreamLoop from continuing to fire 410s while the supervisor
+// rebuilds. The Once guard means concurrent up/down errors that both
+// hit 410 don't double-close the channel.
+func TestSignalSessionLost(t *testing.T) {
+	cc := &ClientCarrier{
+		sessionLost: make(chan struct{}),
+	}
+	cc.ctx, cc.cancel = context.WithCancel(context.Background())
+
+	cc.signalSessionLost()
+
+	select {
+	case <-cc.SessionLost():
+	case <-time.After(time.Second):
+		t.Fatal("SessionLost channel not closed after signalSessionLost")
+	}
+	select {
+	case <-cc.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("ctx not cancelled after signalSessionLost")
+	}
+
+	// Idempotent: a second call must not panic on close-of-closed-channel.
+	cc.signalSessionLost()
+	cc.signalSessionLost()
 }
