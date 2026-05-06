@@ -33,6 +33,7 @@ func main() {
 	outboundServer := flag.String("outbound-server", "", "outbound VMess+WS server address (host:port)")
 	outboundUUID := flag.String("outbound-uuid", "", "outbound VMess user UUID")
 	outboundWSPath := flag.String("outbound-ws-path", "", "outbound WebSocket path (e.g. /relay)")
+	allowCIDR := flag.String("allow-cidr", "", "comma-separated CIDRs to bypass the default private/bogon deny list (e.g. 192.168.0.0/16)")
 	flag.Parse()
 
 	// Secrets fall back to env vars when the corresponding flag is empty.
@@ -98,6 +99,7 @@ func main() {
 		PaddingConfig: *paddingConfig,
 		Verbose:       *verbose,
 		Outbound:      ob,
+		AllowCIDR:     *allowCIDR,
 	})
 
 	if err := srv.Run(ctx); err != nil && err != http.ErrServerClosed {

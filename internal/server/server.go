@@ -59,6 +59,10 @@ type Config struct {
 
 	// Outbound proxy (optional — routes proxied traffic through an upstream proxy)
 	Outbound outbound.Dialer
+
+	// AllowCIDR is a comma-separated list of IP CIDRs that bypass the default
+	// private/bogon deny list. Empty = strict default-deny.
+	AllowCIDR string
 }
 
 type serverSession struct {
@@ -174,13 +178,19 @@ type Server struct {
 	sessions   map[string]*serverSession
 	paddingCfg atomic.Pointer[mux.PaddingConfig]
 	morpher    *morph.Morpher
+	policy     *targetPolicy
 }
 
 func New(cfg Config) *Server {
+	policy, err := newTargetPolicy(cfg.AllowCIDR)
+	if err != nil {
+		log.Fatalf("server: %v", err)
+	}
 	s := &Server{
 		config:   cfg,
 		auth:     auth.New(cfg.PSK),
 		sessions: make(map[string]*serverSession),
+		policy:   policy,
 	}
 
 	// Initialize padding config
@@ -563,11 +573,27 @@ func (s *Server) handleProxy(st *mux.Stream) {
 		return
 	}
 
-	var (
-		dest net.Conn
-		err  error
-	)
+	// Resolve and policy-check before dial. resolveAndCheck rejects targets
+	// where every resolved IP falls in the bogon/private deny list (unless
+	// punched through with --allow-cidr). Dial each allowed IP directly so
+	// a DNS rebinding to a denied address between resolve and dial cannot
+	// flip a passing check into a denied destination.
+	allowedIPs, port, err := s.policy.resolveAndCheck(target)
+	if err != nil {
+		if s.config.Verbose {
+			log.Printf("dial %s: %v", target, err)
+		} else {
+			log.Printf("dial denied")
+		}
+		return
+	}
+
+	var dest net.Conn
 	if s.config.Outbound != nil {
+		// Outbound carries the original host:port string; this is fine for
+		// pure relays where we trust the upstream not to re-resolve into a
+		// different IP. The policy still ran above so a denied target was
+		// already rejected.
 		dest, err = s.config.Outbound.DialTarget(target)
 	} else {
 		// Built-in dialer with TCP keepalive: detects dead targets within
@@ -575,9 +601,18 @@ func (s *Server) handleProxy(st *mux.Stream) {
 		// silently drops the connection (NAT timeout, mid-box reboot,
 		// etc.) doesn't leave us with a zombie mux stream and goroutines.
 		dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-		dest, err = dialer.Dial("tcp", target)
+		// Walk the allow-list IPs in order, returning the first connection
+		// that succeeds. Pure happy-path single-IP targets land on the
+		// first iteration; multi-A-record sites get implicit failover.
+		for _, ip := range allowedIPs {
+			addr := net.JoinHostPort(ip.String(), port)
+			dest, err = dialer.Dial("tcp", addr)
+			if err == nil {
+				break
+			}
+		}
 	}
-	if err != nil {
+	if err != nil || dest == nil {
 		if s.config.Verbose {
 			log.Printf("dial %s: %v", target, err)
 		} else {

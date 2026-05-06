@@ -91,6 +91,12 @@ func (s *Server) handleUDPRelay(st *mux.Stream) {
 			if perr != nil {
 				continue
 			}
+			// Policy gate matches the TCP path: drop datagrams to denied
+			// addresses (loopback / RFC1918 / link-local etc.) silently
+			// rather than amplifying a probe through the proxy.
+			if !s.policy.Allowed(targetAddr.IP) {
+				continue
+			}
 			if _, werr := pc.WriteTo(data, targetAddr); werr != nil {
 				// Most write errors on an unconnected PacketConn are
 				// per-packet — keep the relay alive and drop this one.
