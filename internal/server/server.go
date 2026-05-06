@@ -444,11 +444,20 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if r.Method == http.MethodPost {
+	switch r.Method {
+	case http.MethodPost:
 		s.handleUpstream(w, r, ss)
-		return
+	case http.MethodGet:
+		s.handleDownstream(w, r, ss)
+	default:
+		// The tunnel endpoint only speaks GET (downstream) and POST
+		// (upstream). Anything else (PUT, DELETE, HEAD via probe, etc.)
+		// is rejected explicitly so an unrelated request type cannot fall
+		// through to handleDownstream and tie up the session's downstream
+		// handler slot.
+		w.Header().Set("Allow", "GET, POST")
+		s.apiError(w, http.StatusMethodNotAllowed)
 	}
-	s.handleDownstream(w, r, ss)
 }
 
 // handleUpstream accepts POST'd upstream mux bytes at an absolute offset
@@ -595,27 +604,29 @@ func (s *Server) handleProxy(st *mux.Stream) {
 	}
 
 	var dest net.Conn
-	if s.config.Outbound != nil {
-		// Outbound carries the original host:port string; this is fine for
-		// pure relays where we trust the upstream not to re-resolve into a
-		// different IP. The policy still ran above so a denied target was
-		// already rejected.
-		dest, err = s.config.Outbound.DialTarget(target)
-	} else {
-		// Built-in dialer with TCP keepalive: detects dead targets within
-		// ~75s instead of the OS default ~2 hours, so a server that
-		// silently drops the connection (NAT timeout, mid-box reboot,
-		// etc.) doesn't leave us with a zombie mux stream and goroutines.
-		dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-		// Walk the allow-list IPs in order, returning the first connection
-		// that succeeds. Pure happy-path single-IP targets land on the
-		// first iteration; multi-A-record sites get implicit failover.
-		for _, ip := range allowedIPs {
-			addr := net.JoinHostPort(ip.String(), port)
+	// Built-in dialer with TCP keepalive: detects dead targets within
+	// ~75s instead of the OS default ~2 hours, so a server that silently
+	// drops the connection (NAT timeout, mid-box reboot, etc.) doesn't
+	// leave us with a zombie mux stream and goroutines.
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	// Walk the allow-list IPs in order, returning the first connection
+	// that succeeds. Pure happy-path single-IP targets land on the first
+	// iteration; multi-A-record sites get implicit failover.
+	//
+	// Both branches receive the resolved-IP form (ip:port) — passing the
+	// original hostname to outbound would re-open the DNS-rebind window
+	// on the relay's side, undoing the resolveAndCheck above. Mirage's
+	// outbound is a pure byte relay, so it doesn't need the hostname for
+	// SNI or anything else.
+	for _, ip := range allowedIPs {
+		addr := net.JoinHostPort(ip.String(), port)
+		if s.config.Outbound != nil {
+			dest, err = s.config.Outbound.DialTarget(addr)
+		} else {
 			dest, err = dialer.Dial("tcp", addr)
-			if err == nil {
-				break
-			}
+		}
+		if err == nil {
+			break
 		}
 	}
 	if err != nil || dest == nil {
