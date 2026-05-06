@@ -34,6 +34,7 @@ func main() {
 	outboundUUID := flag.String("outbound-uuid", "", "outbound VMess user UUID")
 	outboundWSPath := flag.String("outbound-ws-path", "", "outbound WebSocket path (e.g. /relay)")
 	allowCIDR := flag.String("allow-cidr", "", "comma-separated CIDRs to bypass the default private/bogon deny list (e.g. 192.168.0.0/16)")
+	adminListen := flag.String("admin-listen", "", "loopback host:port for the JSON /status endpoint (e.g. 127.0.0.1:9444). Empty = disabled.")
 	flag.Parse()
 
 	// Secrets fall back to env vars when the corresponding flag is empty.
@@ -100,6 +101,7 @@ func main() {
 		Verbose:       *verbose,
 		Outbound:      ob,
 		AllowCIDR:     *allowCIDR,
+		AdminListen:   *adminListen,
 	})
 
 	if err := srv.Run(ctx); err != nil && err != http.ErrServerClosed {

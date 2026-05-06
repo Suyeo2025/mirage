@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/houden/mirage/internal/admin"
 	"github.com/houden/mirage/internal/auth"
 	"github.com/houden/mirage/internal/morph"
 	"github.com/houden/mirage/internal/mux"
@@ -63,6 +64,11 @@ type Config struct {
 	// AllowCIDR is a comma-separated list of IP CIDRs that bypass the default
 	// private/bogon deny list. Empty = strict default-deny.
 	AllowCIDR string
+
+	// AdminListen is an optional loopback host:port. When non-empty the
+	// server serves a JSON /status endpoint there for live diagnostics.
+	// internal/admin.Listen refuses to bind anywhere off the loopback.
+	AdminListen string
 }
 
 type serverSession struct {
@@ -179,6 +185,7 @@ type Server struct {
 	paddingCfg atomic.Pointer[mux.PaddingConfig]
 	morpher    *morph.Morpher
 	policy     *targetPolicy
+	startTime  time.Time
 }
 
 func New(cfg Config) *Server {
@@ -187,10 +194,11 @@ func New(cfg Config) *Server {
 		log.Fatalf("server: %v", err)
 	}
 	s := &Server{
-		config:   cfg,
-		auth:     auth.New(cfg.PSK),
-		sessions: make(map[string]*serverSession),
-		policy:   policy,
+		config:    cfg,
+		auth:      auth.New(cfg.PSK),
+		sessions:  make(map[string]*serverSession),
+		policy:    policy,
+		startTime: time.Now(),
 	}
 
 	// Initialize padding config
@@ -272,6 +280,12 @@ func (s *Server) Run(ctx context.Context) error {
 		go s.watchPaddingConfig(ctx, s.config.PaddingConfig)
 	}
 
+	if s.config.AdminListen != "" {
+		if err := admin.Listen(s.config.AdminListen, s.AdminHandler()); err != nil {
+			return err
+		}
+	}
+
 	// Graceful shutdown
 	go func() {
 		<-ctx.Done()
@@ -344,6 +358,12 @@ func (s *Server) runWithReality(ctx context.Context, srv *http.Server, handler h
 	go s.sessionReaper(ctx)
 	if s.config.PaddingConfig != "" {
 		go s.watchPaddingConfig(ctx, s.config.PaddingConfig)
+	}
+
+	if s.config.AdminListen != "" {
+		if err := admin.Listen(s.config.AdminListen, s.AdminHandler()); err != nil {
+			return err
+		}
 	}
 
 	go func() {

@@ -81,6 +81,17 @@ type ClientCarrier struct {
 	//                 stopped reading.
 	upAckedOff atomic.Uint64
 	downRxOff  atomic.Uint64
+
+	// Health counters for the admin /status endpoint. Cheap (atomic ops)
+	// and worth their weight: knowing whether the carrier is currently
+	// flapping or has been stable since boot is the single biggest
+	// diagnostic signal during a live incident.
+	upConsecErr   atomic.Int32 // consecutive POST failures, reset on success
+	downConsecErr atomic.Int32 // consecutive GET failures, reset on success
+	transportResets atomic.Uint32 // total resetTransport calls since boot
+	lastUpErrUnix   atomic.Int64 // unix sec of most recent POST error
+	lastDownErrUnix atomic.Int64 // unix sec of most recent GET error
+	startTime       time.Time
 }
 
 type ClientCarrierConfig struct {
@@ -135,6 +146,7 @@ func NewClientCarrier(cfg ClientCarrierConfig) *ClientCarrier {
 		ctx:          ctx,
 		cancel:       cancel,
 		buildDialTLS: buildDialer,
+		startTime:    time.Now(),
 	}
 	cc.epochCtx, cc.epochCancel = context.WithCancel(ctx)
 	return cc
@@ -159,6 +171,7 @@ func (c *ClientCarrier) currentEpoch() context.Context {
 func (c *ClientCarrier) resetTransport() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.transportResets.Add(1)
 	log.Printf("carrier: resetting HTTP/2 transport")
 
 	// 1. Abort everything derived from the current epoch. Pending requests
@@ -290,6 +303,44 @@ func (c *ClientCarrier) Run() {
 	wg.Wait()
 }
 
+// CarrierStats is the snapshot returned by the client's admin /status. The
+// counters are the minimum diagnostic surface needed during a live incident:
+// is the carrier flapping right now, when did it last hiccup, has the
+// HTTP/2 transport had to be torn down and rebuilt.
+type CarrierStats struct {
+	ServerURL         string `json:"server_url"`
+	UptimeSec         int64  `json:"uptime_sec"`
+	UpAckedOff        uint64 `json:"up_acked_off"`
+	DownRxOff         uint64 `json:"down_rx_off"`
+	UpConsecErrors    int32  `json:"up_consecutive_errors"`
+	DownConsecErrors  int32  `json:"down_consecutive_errors"`
+	TransportResets   uint32 `json:"transport_resets_total"`
+	LastUpErrAgeSec   int64  `json:"last_up_err_age_sec"`   // -1 if never
+	LastDownErrAgeSec int64  `json:"last_down_err_age_sec"` // -1 if never
+}
+
+// Stats returns a point-in-time view. All reads are atomic loads; no lock.
+func (c *ClientCarrier) Stats() CarrierStats {
+	now := time.Now().Unix()
+	ageOrSentinel := func(unix int64) int64 {
+		if unix <= 0 {
+			return -1
+		}
+		return now - unix
+	}
+	return CarrierStats{
+		ServerURL:         c.serverURL,
+		UptimeSec:         int64(time.Since(c.startTime).Seconds()),
+		UpAckedOff:        c.upAckedOff.Load(),
+		DownRxOff:         c.downRxOff.Load(),
+		UpConsecErrors:    c.upConsecErr.Load(),
+		DownConsecErrors:  c.downConsecErr.Load(),
+		TransportResets:   c.transportResets.Load(),
+		LastUpErrAgeSec:   ageOrSentinel(c.lastUpErrUnix.Load()),
+		LastDownErrAgeSec: ageOrSentinel(c.lastDownErrUnix.Load()),
+	}
+}
+
 func (c *ClientCarrier) Stop() {
 	c.epochMu.Lock()
 	if c.epochCancel != nil {
@@ -347,14 +398,18 @@ func (c *ClientCarrier) upstreamLoop() {
 			}
 			if err := c.sendPost(data, off); err != nil {
 				consecutiveErrors++
+				c.upConsecErr.Store(int32(consecutiveErrors))
+				c.lastUpErrUnix.Store(time.Now().Unix())
 				log.Printf("carrier up: %v (errors=%d)", err, consecutiveErrors)
 				if consecutiveErrors >= resetErrorThreshold {
 					c.resetTransport()
 					consecutiveErrors = 0
+					c.upConsecErr.Store(0)
 				}
 				time.Sleep(backoffDelay(consecutiveErrors))
 			} else {
 				consecutiveErrors = 0
+				c.upConsecErr.Store(0)
 			}
 			keepalive.Reset(keepaliveInterval())
 		case <-keepalive.C:
@@ -363,12 +418,16 @@ func (c *ClientCarrier) upstreamLoop() {
 			// trim its downstream replay buffer.
 			if err := c.sendPost(nil, c.upAckedOff.Load()); err != nil {
 				consecutiveErrors++
+				c.upConsecErr.Store(int32(consecutiveErrors))
+				c.lastUpErrUnix.Store(time.Now().Unix())
 				if consecutiveErrors >= resetErrorThreshold {
 					c.resetTransport()
 					consecutiveErrors = 0
+					c.upConsecErr.Store(0)
 				}
 			} else {
 				consecutiveErrors = 0
+				c.upConsecErr.Store(0)
 			}
 			keepalive.Reset(keepaliveInterval())
 		}
@@ -463,14 +522,18 @@ func (c *ClientCarrier) downstreamLoop() {
 		}
 		if err := c.openGet(); err != nil {
 			consecutiveErrors++
+			c.downConsecErr.Store(int32(consecutiveErrors))
+			c.lastDownErrUnix.Store(time.Now().Unix())
 			log.Printf("carrier down: %v (errors=%d)", err, consecutiveErrors)
 			if consecutiveErrors >= resetErrorThreshold {
 				c.resetTransport()
 				consecutiveErrors = 0
+				c.downConsecErr.Store(0)
 			}
 			time.Sleep(backoffDelay(consecutiveErrors))
 		} else {
 			consecutiveErrors = 0
+			c.downConsecErr.Store(0)
 		}
 	}
 }

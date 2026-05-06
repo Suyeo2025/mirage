@@ -19,6 +19,7 @@ func main() {
 	realityPubKey := flag.String("reality-public-key", "", "REALITY server public key (base64)")
 	realityShortID := flag.String("reality-short-id", "", "REALITY short ID (hex)")
 	realitySNI := flag.String("reality-sni", "", "REALITY server name (e.g. troncent.com)")
+	adminListen := flag.String("admin-listen", "", "loopback host:port for the JSON /status endpoint (e.g. 127.0.0.1:1099). Empty = disabled.")
 	flag.Parse()
 
 	// PSK falls back to env so systemd can pass it through a 0600
@@ -42,6 +43,7 @@ func main() {
 		RealityPublicKey: *realityPubKey,
 		RealityShortID:   *realityShortID,
 		RealitySNI:       *realitySNI,
+		AdminListen:      *adminListen,
 	})
 
 	if err := c.Run(ctx); err != nil {

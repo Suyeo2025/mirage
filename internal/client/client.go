@@ -10,6 +10,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/houden/mirage/internal/admin"
 	"github.com/houden/mirage/internal/auth"
 	"github.com/houden/mirage/internal/carrier"
 	"github.com/houden/mirage/internal/morph"
@@ -27,6 +28,11 @@ type Config struct {
 	RealityPublicKey string
 	RealityShortID   string
 	RealitySNI       string
+
+	// AdminListen is an optional loopback host:port. When non-empty the
+	// client serves a JSON /status endpoint there for live diagnostics.
+	// internal/admin.Listen refuses to bind anywhere off the loopback.
+	AdminListen string
 }
 
 type Client struct {
@@ -51,6 +57,7 @@ func New(cfg Config) *Client {
 }
 
 func (c *Client) Run(ctx context.Context) error {
+	started := time.Now()
 	// upstream: mux writes frames → ReplayPipe → carrier Snapshot+POST.
 	// ReplayPipe is offset-aware: POST body is read non-destructively from
 	// the last-acknowledged byte, letting a failed or reset POST be retried
@@ -104,6 +111,12 @@ func (c *Client) Run(ctx context.Context) error {
 	}()
 
 	log.Printf("SOCKS5 on %s → %s", c.config.Listen, c.config.ServerAddr)
+
+	if c.config.AdminListen != "" {
+		if err := admin.Listen(c.config.AdminListen, adminHandler(c.config, c.sessionID, started, car)); err != nil {
+			return err
+		}
+	}
 
 	ln, err := net.Listen("tcp", c.config.Listen)
 	if err != nil {
