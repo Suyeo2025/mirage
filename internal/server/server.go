@@ -566,7 +566,15 @@ func (s *Server) handleDownstream(w http.ResponseWriter, r *http.Request, ss *se
 			}
 			flusher.Flush()
 			offset += uint64(len(data))
-			ss.touch()
+			// Intentionally NOT calling ss.touch() here. lastActive must
+			// only reflect *inbound* activity (POST received, new request
+			// arrived) so the reaper can detect a dead client. Outbound
+			// writes succeed against a dead peer's TCP socket for as long
+			// as the kernel buffer accepts bytes — at our decoy cadence
+			// of ~800 B/s that can be hours — so touching here would keep
+			// zombie sessions "alive" long after the client process is
+			// gone. Healthy clients post a keepalive every 3–8 s, which
+			// updates lastActive via handleTunnel.
 		}
 		if err != nil {
 			// ctx.Err() means we were superseded or the session tore down.
@@ -681,6 +689,19 @@ func (s *Server) serveWebsite(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`<!DOCTYPE html><html><head><title>404</title></head><body><h1>Not Found</h1></body></html>`))
 }
 
+// sessionIdleThreshold is how long a session may stay in s.sessions without
+// inbound activity before the reaper tears it down. Healthy clients post a
+// keepalive every 3–8 s, so 10 minutes is ~75x the keepalive interval —
+// generous enough to ride out brief ISP blips while still cleaning up dead
+// clients before their decoy generators waste meaningful CPU/bandwidth.
+//
+// The previous threshold was 1 h, set defensively so a long disruption
+// followed by reconnect-with-stale-offset wouldn't trigger a 410 storm.
+// That trade-off is no longer required: client-side 410 is now an in-process
+// rebuild (see internal/carrier supervise loop), so a single 410 just costs
+// one fresh sessionID, not a process restart.
+const sessionIdleThreshold = 10 * 60 // seconds
+
 // sessionReaper periodically cleans up idle sessions.
 func (s *Server) sessionReaper(ctx context.Context) {
 	ticker := time.NewTicker(60 * time.Second)
@@ -693,13 +714,7 @@ func (s *Server) sessionReaper(ctx context.Context) {
 			s.mu.Lock()
 			now := time.Now().Unix()
 			for key, ss := range s.sessions {
-				// 1 hour of idle before reaping. Previously 5 min, which
-				// was too aggressive: any network disruption longer than 5
-				// min (sing-box restart plus flapping, ISP blip, etc.)
-				// would cause the session to be reaped, and when the client
-				// eventually reconnected its upAckedOff would no longer
-				// match the server's reset upRecv → 410 storm.
-				if now-ss.lastActive.Load() > 3600 {
+				if now-ss.lastActive.Load() > sessionIdleThreshold {
 					ss.teardown() // sync.Once-guarded full cleanup
 					delete(s.sessions, key)
 					log.Printf("reaped idle session")

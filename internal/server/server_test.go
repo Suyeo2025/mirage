@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/houden/mirage/internal/mux"
 )
 
 // trackingWriter records peak concurrent Write calls. Used to detect whether
@@ -31,6 +34,48 @@ func (t *trackingWriter) Write(p []byte) (int, error) {
 		time.Sleep(t.sleep)
 	}
 	return len(p), nil
+}
+
+// TestHandleDownstreamDoesNotTouchSession is the regression test for the
+// zombie-session bug: previously handleDownstream called ss.touch() after
+// every successful Write, so a session whose client process had died kept
+// looking "active" to the reaper for as long as the kernel TCP buffer
+// accepted decoy bytes. Now lastActive only reflects inbound activity.
+//
+// We exercise the loop by writing one small frame into the downstream
+// ReplayPipe, letting handleDownstream forward it to a stub ResponseWriter,
+// and asserting that ss.lastActive did not advance.
+func TestHandleDownstreamDoesNotTouchSession(t *testing.T) {
+	pipe := mux.NewReplayPipe()
+	ss := &serverSession{
+		downstream: pipe,
+	}
+	// Pin lastActive to a fixed point in the past so any touch would visibly
+	// jump it forward.
+	const pinned = int64(1_000_000)
+	ss.lastActive.Store(pinned)
+
+	pipe.Write([]byte("hello"))
+
+	// Run handleDownstream against a recorder; cancel after a beat so the
+	// loop returns and we can inspect state.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/tunnel", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	s := &Server{}
+	s.handleDownstream(rec, req, ss)
+
+	if got := ss.lastActive.Load(); got != pinned {
+		t.Fatalf("lastActive moved from %d to %d — handleDownstream is still touching the session", pinned, got)
+	}
+	if rec.Body.Len() == 0 {
+		t.Fatal("response body empty — handleDownstream didn't forward the frame")
+	}
 }
 
 // TestTunnelRejectsNonGetPostMethods verifies the tunnel endpoint replies 405
