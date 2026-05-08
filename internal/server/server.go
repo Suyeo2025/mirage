@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -69,6 +70,14 @@ type Config struct {
 	// server serves a JSON /status endpoint there for live diagnostics.
 	// internal/admin.Listen refuses to bind anywhere off the loopback.
 	AdminListen string
+
+	// MaxSessions caps the number of concurrent server sessions. New
+	// sessions beyond the cap are rejected with HTTP 503 — defensive
+	// posture against a leaked PSK being used to spam the server with
+	// fresh sessionIDs and exhaust memory/file descriptors. Zero means
+	// unlimited; the default in main.go is 1000, well above any realistic
+	// legitimate concurrent-client count.
+	MaxSessions int
 }
 
 type serverSession struct {
@@ -378,14 +387,27 @@ func (s *Server) runWithReality(ctx context.Context, srv *http.Server, handler h
 	return srv.Serve(realityLn)
 }
 
-func (s *Server) getOrCreateSession(sessionID []byte) *serverSession {
+// errTooManySessions is returned by getOrCreateSession when the server has
+// hit its concurrent session cap. Caller (handleTunnel) translates this to
+// HTTP 503.
+var errTooManySessions = errors.New("server: max sessions reached")
+
+func (s *Server) getOrCreateSession(sessionID []byte) (*serverSession, error) {
 	key := string(sessionID)
 	s.mu.Lock()
 	ss, exists := s.sessions[key]
 	if exists {
 		s.mu.Unlock()
 		ss.touch()
-		return ss
+		return ss, nil
+	}
+
+	// Cap check before allocating any per-session state. Zero MaxSessions
+	// means unlimited (back-compat with tests / call sites that don't set
+	// the field).
+	if s.config.MaxSessions > 0 && len(s.sessions) >= s.config.MaxSessions {
+		s.mu.Unlock()
+		return nil, errTooManySessions
 	}
 
 	// downstream: mux writes frames here → GET handler ReadFromBlock at client's
@@ -437,7 +459,7 @@ func (s *Server) getOrCreateSession(sessionID []byte) *serverSession {
 	}()
 
 	log.Printf("new session")
-	return ss
+	return ss, nil
 }
 
 func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
@@ -452,7 +474,14 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ss := s.getOrCreateSession(sessionID)
+	ss, err := s.getOrCreateSession(sessionID)
+	if err != nil {
+		// errTooManySessions → 503 Service Unavailable so a polite client
+		// retries with backoff instead of a 410 rebuild loop. Any other
+		// future error from getOrCreateSession also lands here.
+		s.apiError(w, http.StatusServiceUnavailable)
+		return
+	}
 	ss.touch()
 
 	// Both directions carry X-Mirage-Rx: the client's report of how many

@@ -35,6 +35,7 @@ func main() {
 	outboundWSPath := flag.String("outbound-ws-path", "", "outbound WebSocket path (e.g. /relay)")
 	allowCIDR := flag.String("allow-cidr", "", "comma-separated CIDRs to bypass the default private/bogon deny list (e.g. 192.168.0.0/16)")
 	adminListen := flag.String("admin-listen", "", "loopback host:port for the JSON /status endpoint (e.g. 127.0.0.1:9444). Empty = disabled.")
+	maxSessions := flag.Int("max-sessions", 1000, "concurrent server-session cap; new sessions beyond this are rejected with 503. 0 = unlimited.")
 	flag.Parse()
 
 	// Secrets fall back to env vars when the corresponding flag is empty.
@@ -102,6 +103,7 @@ func main() {
 		Outbound:      ob,
 		AllowCIDR:     *allowCIDR,
 		AdminListen:   *adminListen,
+		MaxSessions:   *maxSessions,
 	})
 
 	if err := srv.Run(ctx); err != nil && err != http.ErrServerClosed {

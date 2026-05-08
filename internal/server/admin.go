@@ -14,6 +14,7 @@ import (
 type ServerStats struct {
 	UptimeSec      int64          `json:"uptime_sec"`
 	SessionCount   int            `json:"session_count"`
+	SessionLimit   int            `json:"session_limit"` // 0 = unlimited
 	Sessions       []SessionStats `json:"sessions"`
 	PolicyAllowCnt int            `json:"policy_allow_cidrs"`
 	PolicyDenyCnt  int            `json:"policy_deny_cidrs"`
@@ -68,6 +69,7 @@ func (s *Server) Stats() ServerStats {
 	return ServerStats{
 		UptimeSec:      int64(time.Since(s.startTime).Seconds()),
 		SessionCount:   count,
+		SessionLimit:   s.config.MaxSessions,
 		Sessions:       sessions,
 		PolicyAllowCnt: allowCnt,
 		PolicyDenyCnt:  denyCnt,

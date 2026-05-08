@@ -36,6 +36,45 @@ func (t *trackingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// TestSessionCapRejects503 verifies the MaxSessions cap on getOrCreateSession.
+// A leaked PSK can otherwise be used to spam the server with fresh sessionIDs
+// and exhaust memory / file descriptors; this test pins the cap at 2 and
+// asserts the third sessionID gets HTTP 503 instead of joining the table.
+func TestSessionCapRejects503(t *testing.T) {
+	s := New(Config{
+		PSK:         "x" + strings.Repeat("a", 32),
+		Domain:      "test",
+		MaxSessions: 2,
+	})
+
+	// First two sessions should be created cleanly.
+	for i := 0; i < 2; i++ {
+		sid := []byte(strings.Repeat(string(rune('a'+i)), 16))
+		ss, err := s.getOrCreateSession(sid)
+		if err != nil || ss == nil {
+			t.Fatalf("session %d: err=%v ss=%v", i, err, ss)
+		}
+	}
+
+	// Third triggers the cap.
+	if _, err := s.getOrCreateSession([]byte("ccccccccccccccccc")); err != errTooManySessions {
+		t.Fatalf("expected errTooManySessions, got %v", err)
+	}
+
+	// And handleTunnel translates that to 503.
+	tok, err := s.auth.Generate(1, []byte("ddddddddddddddddd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/tunnel", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	s.handleTunnel(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("over-cap POST → %d, want 503", rec.Code)
+	}
+}
+
 // TestHandleDownstreamDoesNotTouchSession is the regression test for the
 // zombie-session bug: previously handleDownstream called ss.touch() after
 // every successful Write, so a session whose client process had died kept
