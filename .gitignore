@@ -4,3 +4,9 @@ bin/
 *.out
 .DS_Store
 .gitnexus
+
+# Gitnexus auto-generated agent context. Regenerated on every `analyze`,
+# so committing them produces noise diffs and stale-index churn.
+AGENTS.md
+CLAUDE.md
+.claude/skills/gitnexus/
