@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"runtime"
 	"time"
 
 	"github.com/houden/mirage/internal/carrier"
@@ -14,6 +15,7 @@ import (
 // incidents) with a few client-shaped fields.
 type ClientStats struct {
 	UptimeSec      int64                `json:"uptime_sec"`
+	Goroutines     int                  `json:"goroutines"`
 	SessionIDShort string               `json:"session_id_short"`
 	Listen         string               `json:"listen"`
 	ServerAddr     string               `json:"server_addr"`
@@ -35,6 +37,7 @@ func (c *Client) adminHandler() http.Handler {
 		}
 		cur := c.live.Load()
 		stats := ClientStats{
+			Goroutines: runtime.NumGoroutine(),
 			Listen:     c.config.Listen,
 			ServerAddr: c.config.ServerAddr,
 			RealityOn:  c.config.RealityPublicKey != "",

@@ -92,7 +92,11 @@ type serverSession struct {
 	//            upstreamW. Clients include their X-Mirage-Offset on each
 	//            POST; server dedupes any overlap using upRecv and responds
 	//            with X-Mirage-Rx: upRecv.
-	upRecv atomic.Uint64
+	//   downSent — total bytes pushed into the downstream HTTP/2 GET
+	//              response across all GET rotations. Diagnostic only;
+	//              does NOT update lastActive (see handleDownstream).
+	upRecv   atomic.Uint64
+	downSent atomic.Uint64
 
 	stopDecoys func() // cancel decoy generator on teardown
 
@@ -595,6 +599,7 @@ func (s *Server) handleDownstream(w http.ResponseWriter, r *http.Request, ss *se
 			}
 			flusher.Flush()
 			offset += uint64(len(data))
+			ss.downSent.Add(uint64(len(data)))
 			// Intentionally NOT calling ss.touch() here. lastActive must
 			// only reflect *inbound* activity (POST received, new request
 			// arrived) so the reaper can detect a dead client. Outbound
@@ -705,7 +710,7 @@ func (s *Server) handleProxy(st *mux.Stream) {
 func (s *Server) apiError(w http.ResponseWriter, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	w.Write([]byte(fmt.Sprintf(`{"error":"unauthorized","code":%d}`, code)))
+	fmt.Fprintf(w, `{"error":"unauthorized","code":%d}`, code)
 }
 
 func (s *Server) serveWebsite(w http.ResponseWriter, r *http.Request) {

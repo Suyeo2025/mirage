@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"runtime"
 	"time"
 )
 
@@ -13,6 +14,7 @@ import (
 // in journalctl when you can't get jq.
 type ServerStats struct {
 	UptimeSec      int64          `json:"uptime_sec"`
+	Goroutines     int            `json:"goroutines"`
 	SessionCount   int            `json:"session_count"`
 	SessionLimit   int            `json:"session_limit"` // 0 = unlimited
 	Sessions       []SessionStats `json:"sessions"`
@@ -29,6 +31,7 @@ type SessionStats struct {
 	IDShort       string `json:"id_short"`
 	IdleSec       int64  `json:"idle_sec"`
 	UpRecv        uint64 `json:"up_recv_bytes"`
+	DownSent      uint64 `json:"down_sent_bytes"`
 	HasDownstream bool   `json:"has_downstream_handler"`
 }
 
@@ -54,6 +57,7 @@ func (s *Server) Stats() ServerStats {
 			IDShort:       short,
 			IdleSec:       now.Unix() - ss.lastActive.Load(),
 			UpRecv:        ss.upRecv.Load(),
+			DownSent:      ss.downSent.Load(),
 			HasDownstream: hasDown,
 		})
 	}
@@ -68,6 +72,7 @@ func (s *Server) Stats() ServerStats {
 
 	return ServerStats{
 		UptimeSec:      int64(time.Since(s.startTime).Seconds()),
+		Goroutines:     runtime.NumGoroutine(),
 		SessionCount:   count,
 		SessionLimit:   s.config.MaxSessions,
 		Sessions:       sessions,
